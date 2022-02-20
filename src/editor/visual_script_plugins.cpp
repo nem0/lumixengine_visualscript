@@ -6,10 +6,12 @@
 #include "editor/utils.h"
 #include "editor/world_editor.h"
 #include "engine/allocator.h"
+#include "engine/crc32.h"
 #include "engine/engine.h"
 #include "engine/file_system.h"
 #include "engine/log.h"
 #include "engine/os.h"
+#include "engine/reflection.h"
 #include "engine/stream.h"
 #include "engine/universe.h"
 
@@ -52,7 +54,10 @@ struct Node {
 		GET_VARIABLE,
 		SET_VARIABLE,
 		SET_PROPERTY,
-		MUL
+		MUL,
+		CALL,
+		VEC3,
+		YAW_TO_DIR
 	};
 
 	void onNodeGUI(Graph& graph) {
@@ -272,6 +277,59 @@ struct SelfNode : Node {
 	}
 };
 
+struct CallNode : Node {
+	CallNode() {}
+	CallNode(reflection::ComponentBase* component, reflection::FunctionBase* function)
+		: component(component)
+		, function(function)
+	{}
+
+	void deserialize(InputMemoryStream& blob) override {
+		Node::deserialize(blob);
+		const u32 cmp_name_hash = blob.read<u32>();
+		const char* func_name = blob.readString();
+		const ComponentType cmp_type = reflection::getComponentTypeFromHash(cmp_name_hash);
+		component = reflection::getComponent(cmp_type);
+		if (component) {
+			const i32 fi = component->functions.find([&](reflection::FunctionBase* func){
+				return equalStrings(func->name, func_name);
+			});
+			if (fi < 0) {
+				logError("Function not found"); // TODO proper error
+			}
+			else {
+				function = component->functions[fi];
+			}
+		}
+		else {
+			logError("Component not found"); // TODO proper error
+		}
+	}
+
+	void serialize(OutputMemoryStream& blob) override {
+		Node::serialize(blob);
+		blob.write(crc32(component->name));
+		blob.writeString(function->name);
+	}
+
+
+	Type getType() const override { return Type::CALL; }
+	void onGUI(Graph& graph) override {
+		flowInput();
+		ImGui::Text("%s.%s", component->name, function->name);
+		ImGui::SameLine();
+		flowOutput();
+		ImGui::NewLine();
+		for (u32 i = 0; i < function->getArgCount(); ++i) {
+			inputPin(); ImGui::Text("Input %d", i);
+		}
+	}
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {}
+
+	const reflection::ComponentBase* component = nullptr;
+	const reflection::FunctionBase* function = nullptr;
+};
+
 struct SetYawNode : Node {
 	Type getType() const override { return Type::SET_YAW; }
 	void onGUI(Graph& graph) override {
@@ -345,11 +403,37 @@ struct MouseMoveNode : Node {
 	}
 };
 
+struct Vec3Node : Node {
+	Type getType() const override { return Type::VEC3; }
+	void onGUI(Graph& graph) override {
+		ImGui::BeginGroup();
+		inputPin(); ImGui::TextUnformatted("X");
+		inputPin(); ImGui::TextUnformatted("Y");
+		inputPin(); ImGui::TextUnformatted("Z");
+		ImGui::EndGroup();
+		ImGui::SameLine();
+		outputPin();
+	}
+	void generate(OutputMemoryStream& blob, const Graph&, u32) override {}
+};
+
+struct YawToDirNode : Node {
+	Type getType() const override { return Type::YAW_TO_DIR; }
+	void onGUI(Graph& graph) override {
+		inputPin(); ImGui::TextUnformatted("Yaw to dir");
+		ImGui::SameLine();
+		outputPin();
+	}
+	void generate(OutputMemoryStream& blob, const Graph&, u32) override {}
+};
+
 struct UpdateNode : Node {
 	Type getType() const override { return Type::UPDATE; }
 	void onGUI(Graph& graph) override {
 		flowOutput();
 		ImGui::TextUnformatted(ICON_FA_CLOCK "Update");
+		outputPin();
+		ImGui::TextUnformatted("Time delta");
 	}
 
 	void generate(OutputMemoryStream& blob, const Graph&, u32) override {
@@ -719,50 +803,71 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 				context_link_ = hovered_link;
 			}
 
-			if (ImGui::BeginPopup("context_menu")) {
-				ImVec2 cp = ImGui::GetItemRectMin();
-				if (ImGui::BeginMenu("Add node")) {
-					Node* n = nullptr;
-					if (ImGui::Selectable("Add")) n = graph_->addNode<AddNode>();
-					if (ImGui::Selectable("Multiply")) n = graph_->addNode<MulNode>();
-					if (ImGui::BeginMenu("Set variable")) {
-						for (const Variable& var : graph_->variables_) {
-							if (var.name.length() > 0 && ImGui::Selectable(var.name.c_str())) {
-								n = graph_->addNode<SetVariableNode>(u32(&var - graph_->variables_.begin()));
-							}
-						}
-						ImGui::EndMenu();
+			contextMenu(editor_pos);
+		}
+		ImGui::End();
+	}
+
+	void contextMenu(const ImVec2& editor_pos) {
+		if (!ImGui::BeginPopup("context_menu")) return;
+
+		ImVec2 cp = ImGui::GetItemRectMin();
+		if (ImGui::BeginMenu("Add node")) {
+			Node* n = nullptr;
+			if (ImGui::Selectable("Add")) n = graph_->addNode<AddNode>();
+			if (ImGui::Selectable("Multiply")) n = graph_->addNode<MulNode>();
+			if (ImGui::BeginMenu("Set variable")) {
+				for (const Variable& var : graph_->variables_) {
+					if (var.name.length() > 0 && ImGui::Selectable(var.name.c_str())) {
+						n = graph_->addNode<SetVariableNode>(u32(&var - graph_->variables_.begin()));
 					}
-					if (ImGui::BeginMenu("Get variable")) {
-						for (const Variable& var : graph_->variables_) {
-							if (var.name.length() > 0 && ImGui::Selectable(var.name.c_str())) {
-								n = graph_->addNode<GetVariableNode>(u32(&var - graph_->variables_.begin()));
-							}
-						}
-						ImGui::EndMenu();
+				}
+				ImGui::EndMenu();
+			}
+			if (ImGui::BeginMenu("Get variable")) {
+				for (const Variable& var : graph_->variables_) {
+					if (var.name.length() > 0 && ImGui::Selectable(var.name.c_str())) {
+						n = graph_->addNode<GetVariableNode>(u32(&var - graph_->variables_.begin()));
 					}
-					if (ImGui::Selectable("Self")) n = graph_->addNode<SelfNode>();
-					if (ImGui::Selectable("Set yaw")) n = graph_->addNode<SetYawNode>();
-					if (ImGui::Selectable("Mouse move")) n = graph_->addNode<MouseMoveNode>();
-					if (ImGui::Selectable("Constant")) n = graph_->addNode<ConstNode>();
-					if (ImGui::Selectable("Set property")) n = graph_->addNode<SetPropertyNode>();
-					if (ImGui::Selectable("Update")) n = graph_->addNode<UpdateNode>();
-					if (ImGui::Selectable("Sequence")) n = graph_->addNode<SequenceNode>();
-					if (n) {
-						n->pos_ = ImGui::GetMousePos() - editor_pos;
+				}
+				ImGui::EndMenu();
+			}
+			if (ImGui::Selectable("Self")) n = graph_->addNode<SelfNode>();
+			if (ImGui::Selectable("Set yaw")) n = graph_->addNode<SetYawNode>();
+			if (ImGui::Selectable("Mouse move")) n = graph_->addNode<MouseMoveNode>();
+			if (ImGui::Selectable("Constant")) n = graph_->addNode<ConstNode>();
+			if (ImGui::Selectable("Set property")) n = graph_->addNode<SetPropertyNode>();
+			if (ImGui::Selectable("Update")) n = graph_->addNode<UpdateNode>();
+			if (ImGui::Selectable("Vector 3")) n = graph_->addNode<Vec3Node>();
+			if (ImGui::Selectable("Yaw to direction")) n = graph_->addNode<YawToDirNode>();
+			if (ImGui::Selectable("Sequence")) n = graph_->addNode<SequenceNode>();
+			if (n) {
+				n->pos_ = ImGui::GetMousePos() - editor_pos;
+			}
+			ImGui::EndMenu();
+		}
+
+		if (ImGui::BeginMenu("Call")) {
+			for (const reflection::RegisteredComponent& rcmp : reflection::getComponents()) {
+				if (!rcmp.cmp->functions.empty() && ImGui::BeginMenu(rcmp.cmp->name)) {
+					for (reflection::FunctionBase* f : rcmp.cmp->functions) {
+						if (ImGui::Selectable(f->name)) {
+							graph_->addNode<CallNode>(rcmp.cmp, f);
+						}
 					}
 					ImGui::EndMenu();
 				}
-				if (context_node_ != -1 && ImGui::Selectable("Remove node")) {
-					graph_->removeNode(context_node_);
-				}
-				if (context_link_ != -1 && ImGui::Selectable("Remove link")) {
-					graph_->removeLink(context_link_);
-				}
-				ImGui::EndPopup();
 			}
+			ImGui::EndMenu();
 		}
-		ImGui::End();
+
+		if (context_node_ != -1 && ImGui::Selectable("Remove node")) {
+			graph_->removeNode(context_node_);
+		}
+		if (context_link_ != -1 && ImGui::Selectable("Remove link")) {
+			graph_->removeLink(context_link_);
+		}
+		ImGui::EndPopup();
 	}
 
 	const char* getName() const override { return "visualscript"; }
@@ -786,9 +891,12 @@ Node* Graph::createNode(Node::Type type) {
 		case Node::Type::CONST: return addNode<ConstNode>();
 		case Node::Type::MOUSE_MOVE: return addNode<MouseMoveNode>();
 		case Node::Type::UPDATE: return addNode<UpdateNode>();
+		case Node::Type::VEC3: return addNode<Vec3Node>();
+		case Node::Type::CALL: return addNode<CallNode>();
 		case Node::Type::GET_VARIABLE: return addNode<GetVariableNode>();
 		case Node::Type::SET_VARIABLE: return addNode<SetVariableNode>();
 		case Node::Type::SET_PROPERTY: return addNode<SetPropertyNode>();
+		case Node::Type::YAW_TO_DIR: return addNode<YawToDirNode>();
 
 		default: ASSERT(false); break;
 	}
