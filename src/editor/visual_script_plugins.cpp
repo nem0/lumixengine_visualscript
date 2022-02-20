@@ -51,7 +51,8 @@ struct Node {
 		UPDATE,
 		GET_VARIABLE,
 		SET_VARIABLE,
-		SET_PROPERTY
+		SET_PROPERTY,
+		MUL
 	};
 
 	void onNodeGUI(Graph& graph) {
@@ -203,12 +204,16 @@ struct Graph {
 	}
 
 	void removeNode(u32 node) {
-		// TODO remove links
+		const u32 node_id = nodes_[node]->id_;
+		for (i32 i = links_.size() - 1; i >= 0; --i) {
+			if ((links_[i].from & 0x7fff) == node_id || (links_[i].to & 0x7fff) == node_id) {
+				links_.erase(i);
+			}	
+		}
 		nodes_.erase(node);
 	}
 
 	void removeLink(u32 link) {
-		// TODO remove links
 		links_.erase(link);
 	}
 
@@ -261,7 +266,8 @@ struct SelfNode : Node {
 		ImGui::TextUnformatted("Self");
 	}
 	
-	void generate(OutputMemoryStream& blob, const Graph&, u32) override {
+	void generate(OutputMemoryStream& blob, const Graph&, u32) override {}
+	void printRef(OutputMemoryStream& blob, const Graph& graph, u32) override {
 		blob << "this";
 	}
 };
@@ -276,7 +282,21 @@ struct SetYawNode : Node {
 		inputPin(); ImGui::TextUnformatted("Yaw");
 	}
 
-	void generate(OutputMemoryStream& blob, const Graph&, u32) override {
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
+		const NodeOutput entity_input = getInputNode(1, graph);
+		const NodeOutput yaw_input = getInputNode(2, graph);
+		if (!entity_input.node) return;
+		if (!yaw_input.node) return;
+
+		entity_input.node->generate(blob, graph, entity_input.output_idx);
+		yaw_input.node->generate(blob, graph, yaw_input.output_idx);
+
+		entity_input.node->printRef(blob, graph, entity_input.output_idx);
+		blob << ".rotation = { 0, math.sin(";
+		yaw_input.node->printRef(blob, graph, yaw_input.output_idx);
+		blob << " * 0.5), 0, math.cos(";
+		yaw_input.node->printRef(blob, graph, yaw_input.output_idx);
+		blob << " * 0.5) }\n";
 	}
 };
 
@@ -319,7 +339,6 @@ struct MouseMoveNode : Node {
 			if (n.node) {
 				n.node->generate(blob, graph, n.input_idx);
 			}
-			blob << "\t";
 			blob << "\tend\n";
 			blob << "end\n";
 		}
@@ -337,6 +356,43 @@ struct UpdateNode : Node {
 		blob << "function update(td)\n";
 		//getOutput(0)->generate(blob);
 		blob << "end\n";
+	}
+};
+
+
+struct MulNode : Node {
+	Type getType() const override { return Type::MUL; }
+
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
+		NodeOutput n0 = getInputNode(0, graph);
+		NodeOutput n1 = getInputNode(1, graph);
+		if (!n0.node || !n1.node) return;
+
+		n0.node->generate(blob, graph, n0.output_idx);
+		n1.node->generate(blob, graph, n1.output_idx);
+
+		blob << "local v" << id_ << " = ";
+		n0.node->printRef(blob, graph, n0.output_idx);
+		blob << " * ";
+		n1.node->printRef(blob, graph, n0.output_idx);
+		blob << "\n";
+	}
+
+	void printRef(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {
+		blob << "v" << id_;
+	}
+
+	void onGUI(Graph& graph) override {
+		ImGui::BeginGroup();
+		inputPin(); ImGui::NewLine();
+		inputPin(); ImGui::NewLine();
+		ImGui::EndGroup();
+
+		ImGui::SameLine();
+		ImGui::TextUnformatted("X");
+
+		ImGui::SameLine();
+		outputPin();
 	}
 };
 
@@ -393,6 +449,11 @@ struct SetVariableNode : Node {
 		blob << graph.variables_[var_].name.c_str() << " = ";
 		n.node->printRef(blob, graph, n.output_idx);
 		blob << "\n";
+
+		const NodeInput on = getOutputNode(0, graph);
+		if (!on.node) return;
+
+		on.node->generate(blob, graph, on.input_idx);
 	}
 
 	void onGUI(Graph& graph) override {
@@ -480,7 +541,11 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 		app_.getSettings().setValue(Settings::GLOBAL, "is_visualscript_editor_open", is_open_);
 	}
 
-	void generate(const Path& path) {
+	void generate() {
+		char path[LUMIX_MAX_PATH];
+		copyString(path, path_.c_str());
+		if (!Path::replaceExtension(path, "lua")) return;
+
 		OutputMemoryStream blob(app_.getAllocator());
 		for (Variable& var : graph_->variables_) {
 			blob << "local " << var.name.c_str() << " = 0\n";
@@ -493,7 +558,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 		}
 		
 		os::OutputFile file;
-		if (app_.getEngine().getFileSystem().open(path.c_str(), file)) {
+		if (file.open(path)) {
 			bool res = file.write(blob.data(), blob.size());
 			if (!res) {
 				logError("Could not write ", path);
@@ -503,6 +568,10 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 	}
 
 	void save(const char* path) {
+		if (!path[0]) {
+			saveAs();
+			return;
+		}
 		OutputMemoryStream blob(app_.getAllocator());
 		graph_->serialize(blob);
 
@@ -568,7 +637,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 				if (ImGui::MenuItem("New")) newGraph();
 				if (ImGui::MenuItem("Load")) load();
 				//if (ImGui::MenuItem("Load from entity", nullptr, false, emitter)) loadFromEntity();
-				if (ImGui::MenuItem("Generate")) generate(Path("scripts/vs.lua"));
+				if (ImGui::MenuItem("Generate")) generate();
 				if (ImGui::MenuItem("Save", nullptr, false, !path_.isEmpty())) save(path_.c_str());
 				if (ImGui::MenuItem("Save as")) saveAs();
 				//ImGui::Separator();
@@ -578,6 +647,9 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 
 				ImGui::EndMenu();
 			}
+			if (ImGuiEx::IconButton(ICON_FA_CHECK, "Generate")) generate();
+			if (ImGuiEx::IconButton(ICON_FA_FOLDER_OPEN, "Load")) load();
+			if (ImGuiEx::IconButton(ICON_FA_SAVE, "Save")) save(path_.c_str());
 			ImGui::EndMenuBar();
 		}
 	}
@@ -649,9 +721,10 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 
 			if (ImGui::BeginPopup("context_menu")) {
 				ImVec2 cp = ImGui::GetItemRectMin();
-				if (ImGui::BeginMenu("Add")) {
+				if (ImGui::BeginMenu("Add node")) {
 					Node* n = nullptr;
 					if (ImGui::Selectable("Add")) n = graph_->addNode<AddNode>();
+					if (ImGui::Selectable("Multiply")) n = graph_->addNode<MulNode>();
 					if (ImGui::BeginMenu("Set variable")) {
 						for (const Variable& var : graph_->variables_) {
 							if (var.name.length() > 0 && ImGui::Selectable(var.name.c_str())) {
@@ -706,6 +779,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 Node* Graph::createNode(Node::Type type) {
 	switch (type) {
 		case Node::Type::ADD: return addNode<AddNode>();
+		case Node::Type::MUL: return addNode<MulNode>();
 		case Node::Type::SEQUENCE: return addNode<SequenceNode>();
 		case Node::Type::SELF: return addNode<SelfNode>();
 		case Node::Type::SET_YAW: return addNode<SetYawNode>();
