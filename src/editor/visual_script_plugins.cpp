@@ -6,6 +6,10 @@
 #include "editor/utils.h"
 #include "editor/world_editor.h"
 #include "engine/allocator.h"
+#include "engine/engine.h"
+#include "engine/file_system.h"
+#include "engine/log.h"
+#include "engine/os.h"
 #include "engine/stream.h"
 #include "engine/universe.h"
 
@@ -19,6 +23,8 @@ struct Link {
 	u32 to;
 };
 
+static const u32 OUTPUT_FLAG = 1 << 15;
+
 struct Variable {
 	enum Type {
 		NUMBER,
@@ -29,47 +35,77 @@ struct Variable {
 	Variable(IAllocator& allocator) : name(allocator) {}
 
 	String name;
-	Type type;
+	//Type type;
 };
 
 struct Graph;
 
 struct Node {
 	void onNodeGUI(Graph& graph) {
-		pin_counter_ = 0;
+		input_pin_counter_ = 0;
+		output_pin_counter_ = 0;
 		ImGuiEx::BeginNode(id_, pos_);
 		onGUI(graph);
 		ImGuiEx::EndNode();
 	}
 
-	virtual void generate(OutputMemoryStream& blob) = 0;
+	virtual const char* getType() const = 0;
+
+	virtual void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) = 0;
+
+	virtual void serialize(OutputMemoryStream& blob) {
+		blob.write(id_);
+		blob.write(pos_);
+	}
+
+	virtual void deserialize(InputMemoryStream& blob) {
+		blob.read(id_);
+		blob.read(pos_);
+	}
 
 	u32 id_ = 0;
 	ImVec2 pos_ = ImVec2(0.f, 0.f);
 
+	virtual void printRef(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) {}
+
 protected:
+	struct NodeInput {
+		Node* node;
+		u32 input_idx;
+	};
+
+	NodeInput getOutputNode(u32 idx, const Graph& graph);
+
+	struct NodeOutput {
+		Node* node;
+		u32 output_idx;
+	};
+
+	NodeOutput getInputNode(u32 idx, const Graph& graph);
+
 	void inputPin() {
-		ImGuiEx::Pin(id_ | (pin_counter_ << 16), true);
-		++pin_counter_;
+		ImGuiEx::Pin(id_ | (input_pin_counter_ << 16), true);
+		++input_pin_counter_;
 	}
 
 	void outputPin() {
-		ImGuiEx::Pin(id_ | (pin_counter_ << 16), false);
-		++pin_counter_;
+		ImGuiEx::Pin(id_ | (output_pin_counter_ << 16) | OUTPUT_FLAG, false);
+		++output_pin_counter_;
 	}
 
 	void flowInput() {
-		ImGuiEx::Pin(id_ | (pin_counter_ << 16), true, ImGuiEx::PinShape::TRIANGLE);
-		++pin_counter_;
+		ImGuiEx::Pin(id_ | (input_pin_counter_ << 16), true, ImGuiEx::PinShape::TRIANGLE);
+		++input_pin_counter_;
 	}
 
 	void flowOutput() {
-		ImGuiEx::Pin(id_ | (pin_counter_ << 16), false, ImGuiEx::PinShape::TRIANGLE);
-		++pin_counter_;
+		ImGuiEx::Pin(id_ | (output_pin_counter_ << 16) | OUTPUT_FLAG, false, ImGuiEx::PinShape::TRIANGLE);
+		++output_pin_counter_;
 	}
 
 	virtual void onGUI(Graph& graph) = 0;
-	u32 pin_counter_ = 0;
+	u32 input_pin_counter_ = 0;
+	u32 output_pin_counter_ = 0;
 };
 
 
@@ -81,16 +117,77 @@ struct Graph {
 		, variables_(allocator)
 	{}
 
+	static constexpr u32 MAGIC = '_LVS';
+
+	bool deserialize(InputMemoryStream& blob) {
+		const u32 magic = blob.read<u32>();
+		if (magic != MAGIC) return false;
+		const u32 version = blob.read<u32>();
+		if (version != 0) return false;
+		
+		blob.read(node_counter_);
+		const u32 var_count = blob.read<u32>();
+		variables_.reserve(var_count);
+		for (u32 i = 0; i < var_count; ++i) {
+			Variable& var = variables_.emplace(allocator_);
+			var.name = blob.readString();
+		}
+
+		const u32 link_count = blob.read<u32>();
+		links_.reserve(link_count);
+		for (u32 i = 0; i < link_count; ++i) {
+			Link& link = links_.emplace();
+			blob.read(link);
+		}
+
+		const u32 node_count = blob.read<u32>();
+		nodes_.reserve(node_count);
+		for (u32 i = 0; i < node_count; ++i) {
+			const char* type = blob.readString();
+			UniquePtr<Node> n = createNode(type);
+			n->deserialize(blob);
+			nodes_.push(n.move());
+		}
+		return true;
+	}
+
+	UniquePtr<Node> createNode(const char* type) {
+		
+	}
+
+	void serialize(OutputMemoryStream& blob) {
+		blob.write(MAGIC);
+		const u32 version = 0;
+		blob.write(version);
+		blob.write(node_counter_);
+		
+		blob.write(variables_.size());
+		for (const Variable& var : variables_) {
+			blob.writeString(var.name.c_str());
+		}
+
+		blob.write(links_.size());
+		for (const Link& link : links_) {
+			blob.write(link);
+		}
+
+		blob.write(nodes_.size());
+		for (const UniquePtr<Node>& node : nodes_) {
+			blob.writeString(node->getType());
+			node->serialize(blob);
+		}
+	}
+
 	IAllocator& allocator_;
 	Array<UniquePtr<Node>> nodes_;
 	Array<Link> links_;
 	Array<Variable> variables_;
 
-	u32 node_counter = 71;
+	u32 node_counter_ = 0;
 	template <typename T, typename... Args>
 	Node* addNode(Args&&... args) {
 		UniquePtr<T> n = UniquePtr<T>::create(allocator_, static_cast<Args&&>(args)...);
-		n->id_ = ++node_counter;
+		n->id_ = ++node_counter_;
 		nodes_.push(n.move());
 		return nodes_.last().get();
 	}
@@ -104,9 +201,35 @@ struct Graph {
 		// TODO remove links
 		links_.erase(link);
 	}
+
+	Node* getNode(u32 id) const {
+		const i32 idx = nodes_.find([&](const UniquePtr<Node>& node){ return node->id_ == id; });
+		return idx < 0 ? nullptr : nodes_[idx].get();
+	}
 };
 
+Node::NodeInput Node::getOutputNode(u32 idx, const Graph& graph) {
+	const i32 i = graph.links_.find([&](Link& l){
+		return l.from == (id_ | (idx << 16) | OUTPUT_FLAG);
+	});
+	if (i == -1) return {nullptr, 0};
+
+	const u32 to = graph.links_[i].to;
+	return { graph.getNode(to & 0x7fFF), to >> 16 };
+}
+
+Node::NodeOutput Node::getInputNode(u32 idx, const Graph& graph) {
+	const i32 i = graph.links_.find([&](Link& l){
+		return l.to == (id_ | (idx << 16));
+	});
+	if (i == -1) return {nullptr, 0};
+
+	const u32 from = graph.links_[i].from;
+	return { graph.getNode(from & 0x7fFF), from >> 16 };
+}
+
 struct SequenceNode : Node {
+	const char* getType() const override { return "sequence"; }
 	void onGUI(Graph& graph) override {
 		flowInput(); ImGui::TextUnformatted(ICON_FA_LIST_OL);
 		ImGui::SameLine();
@@ -116,23 +239,25 @@ struct SequenceNode : Node {
 		if (ImGuiEx::IconButton(ICON_FA_PLUS, "Add")) ++outputs_;
 	}
 	
-	void generate(OutputMemoryStream& blob) override {}
+	void generate(OutputMemoryStream& blob, const Graph&, u32) override {}
 
 	u32 outputs_ = 2;
 };
 
 struct SelfNode : Node {
+	const char* getType() const override { return "self"; }
 	void onGUI(Graph& graph) override {
 		outputPin();
 		ImGui::TextUnformatted("Self");
 	}
 	
-	void generate(OutputMemoryStream& blob) override {
+	void generate(OutputMemoryStream& blob, const Graph&, u32) override {
 		blob << "this";
 	}
 };
 
 struct SetYawNode : Node {
+	const char* getType() const override { return "set_yaw"; }
 	void onGUI(Graph& graph) override {
 		flowInput(); ImGui::TextUnformatted("Set Yaw");
 		ImGui::SameLine();
@@ -141,31 +266,64 @@ struct SetYawNode : Node {
 		inputPin(); ImGui::TextUnformatted("Yaw");
 	}
 
-	void generate(OutputMemoryStream& blob) override {
+	void generate(OutputMemoryStream& blob, const Graph&, u32) override {
 	}
 };
 
-struct MouseMoveNode : Node {
+struct ConstNode : Node {
+	const char* getType() const override { return "const"; }
 	void onGUI(Graph& graph) override {
-		flowOutput(); ImGui::TextUnformatted("Mouse move");
+		outputPin();
+		ImGui::DragFloat("##v", &value_);
+	}
+
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {}
+	void printRef(OutputMemoryStream& blob, const Graph& graph, u32) override {
+		blob << value_;
+	}
+
+	float value_ = 0;
+};
+
+struct MouseMoveNode : Node {
+	const char* getType() const override { return "mouse_move"; }
+	void onGUI(Graph& graph) override {
+		flowOutput(); ImGui::TextUnformatted(ICON_FA_MOUSE " Mouse move");
 		outputPin(); ImGui::TextUnformatted("Delta X");
 		outputPin(); ImGui::TextUnformatted("Delta Y");
 	}
+	
+	void printRef(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {
+		switch(output_idx) {
+			case 0: ASSERT(false); break;
+			case 1: blob << "event.x"; break;
+			case 2: blob << "event.y"; break;
+		}
+	}
 
-	void generate(OutputMemoryStream& blob) override {
-		blob << "function onInputEvent(event)\n";
-		
-		blob << "end\n";
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {
+		if (output_idx == 0) {
+			blob << "function onInputEvent(event)\n";
+			blob << "\tif event.type == LumixAPI.INPUT_EVENT_AXIS and event.device.type == LumixAPI.INPUT_DEVICE_MOUSE then\n";
+			Node::NodeInput n = getOutputNode(0, graph);
+			if (n.node) {
+				n.node->generate(blob, graph, n.input_idx);
+			}
+			blob << "\t";
+			blob << "\tend\n";
+			blob << "end\n";
+		}
 	}
 };
 
 struct UpdateNode : Node {
+	const char* getType() const override { return "update"; }
 	void onGUI(Graph& graph) override {
 		flowOutput();
 		ImGui::TextUnformatted(ICON_FA_CLOCK "Update");
 	}
 
-	void generate(OutputMemoryStream& blob) override {
+	void generate(OutputMemoryStream& blob, const Graph&, u32) override {
 		blob << "function update(td)\n";
 		//getOutput(0)->generate(blob);
 		blob << "end\n";
@@ -173,7 +331,27 @@ struct UpdateNode : Node {
 };
 
 struct AddNode : Node {
-	void generate(OutputMemoryStream& blob) override {}
+	const char* getType() const override { return "add"; }
+
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
+		NodeOutput n0 = getInputNode(0, graph);
+		NodeOutput n1 = getInputNode(1, graph);
+		if (!n0.node || !n1.node) return;
+
+		n0.node->generate(blob, graph, n0.output_idx);
+		n1.node->generate(blob, graph, n1.output_idx);
+
+		blob << "local v" << id_ << " = ";
+		n0.node->printRef(blob, graph, n0.output_idx);
+		blob << " + ";
+		n1.node->printRef(blob, graph, n0.output_idx);
+		blob << "\n";
+	}
+
+	void printRef(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {
+		blob << "v" << id_;
+	}
+
 	void onGUI(Graph& graph) override {
 		ImGui::BeginGroup();
 		inputPin(); ImGui::NewLine();
@@ -191,7 +369,21 @@ struct AddNode : Node {
 struct SetVariableNode : Node {
 	SetVariableNode(u32 var) : var_(var) {}
 
-	void generate(OutputMemoryStream& blob) override {}
+	const char* getType() const override { return "set_variable"; }
+
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
+		if (var_ >= (u32)graph.variables_.size()) return;
+		
+		const NodeOutput n = getInputNode(1, graph);
+		if (!n.node) return;
+
+		n.node->generate(blob, graph, n.output_idx);
+
+		blob << graph.variables_[var_].name.c_str() << " = ";
+		n.node->printRef(blob, graph, n.output_idx);
+		blob << "\n";
+	}
+
 	void onGUI(Graph& graph) override {
 		const char* var_name = var_ < (u32)graph.variables_.size() ? graph.variables_[var_].name.c_str() : "N/A";
 		flowInput(); ImGui::Text("Set `%s`", var_name);
@@ -205,7 +397,14 @@ struct SetVariableNode : Node {
 
 struct GetVariableNode : Node {
 	GetVariableNode(u32 var) : var_(var) {}
-	void generate(OutputMemoryStream& blob) override {}
+	const char* getType() const override { return "get_variable"; }
+	void generate(OutputMemoryStream& blob, const Graph&, u32) override {}
+	
+	void printRef(OutputMemoryStream& blob, const Graph& graph, u32) override {
+		if (var_ >= (u32)graph.variables_.size()) return;
+		blob << graph.variables_[var_].name.c_str();
+	}
+
 	void onGUI(Graph& graph) override {
 		outputPin();
 		const char* var_name = var_ < (u32)graph.variables_.size() ? graph.variables_[var_].name.c_str() : "N/A";
@@ -216,7 +415,8 @@ struct GetVariableNode : Node {
 };
 
 struct SetPropertyNode : Node {
-	void generate(OutputMemoryStream& blob) override {
+	const char* getType() const override { return "set_property"; }
+	void generate(OutputMemoryStream& blob, const Graph&, u32) override {
 //		getInput(1)->generate(blob);
 		blob << "." << cmp << "." << prop << " = " << value;
 	}
@@ -268,6 +468,46 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 		app_.getSettings().setValue(Settings::GLOBAL, "is_visualscript_editor_open", is_open_);
 	}
 
+	void generate(const Path& path) {
+		OutputMemoryStream blob(app_.getAllocator());
+		for (Variable& var : graph_->variables_) {
+			blob << "local " << var.name.c_str() << " = 0\n";
+		}
+		
+		for (UniquePtr<Node>& node : graph_->nodes_) {
+			if (equalStrings(node->getType(), "mouse_move")) {
+				node->generate(blob, *graph_.get(), 0);
+			}
+		}
+		
+		os::OutputFile file;
+		if (app_.getEngine().getFileSystem().open(path.c_str(), file)) {
+			bool res = file.write(blob.data(), blob.size());
+			if (!res) {
+				logError("Could not write ", path);
+			}
+			file.close();
+		}
+	}
+
+	void menu() {
+		if (ImGui::BeginMenuBar()) {
+			if (ImGui::BeginMenu("File")) {
+				//if (ImGui::MenuItem("New")) newGraph();
+				//if (ImGui::MenuItem("Load")) load();
+				//if (ImGui::MenuItem("Load from entity", nullptr, false, emitter)) loadFromEntity();
+				if (ImGui::MenuItem("Generate")) generate(Path("scripts/vs.lua"));
+				//if (ImGui::MenuItem("Save as")) saveAs();
+				//ImGui::Separator();
+			
+				//menuItem(m_apply_action, emitter && emitter->getResource());
+				//ImGui::MenuItem("Autoapply", nullptr, &m_autoapply, emitter && emitter->getResource());
+
+				ImGui::EndMenu();
+			}
+			ImGui::EndMenuBar();
+		}
+	}
 
 	void onWindowGUI() override {
 		if (!is_open_) return;
@@ -275,8 +515,8 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 		i32 hovered_node = -1;
 		i32 hovered_link = -1;
 		ImGui::SetNextWindowSize(ImVec2(200, 200), ImGuiCond_FirstUseEver);
-		if (ImGui::Begin("Visual script")) {
-
+		if (ImGui::Begin("Visual script", &is_open_, ImGuiWindowFlags_MenuBar)) {
+			menu();
 			ImGui::Columns(2);
 			static bool once = [](){ ImGui::SetColumnWidth(-1, 150); return true; }();
 			for (Variable& var : graph_->variables_) {
@@ -358,6 +598,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 					if (ImGui::Selectable("Self")) n = graph_->addNode<SelfNode>();
 					if (ImGui::Selectable("Set yaw")) n = graph_->addNode<SetYawNode>();
 					if (ImGui::Selectable("Mouse move")) n = graph_->addNode<MouseMoveNode>();
+					if (ImGui::Selectable("Constant")) n = graph_->addNode<ConstNode>();
 					if (ImGui::Selectable("Set property")) n = graph_->addNode<SetPropertyNode>();
 					if (ImGui::Selectable("Update")) n = graph_->addNode<UpdateNode>();
 					if (ImGui::Selectable("Sequence")) n = graph_->addNode<SequenceNode>();
@@ -383,6 +624,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 	StudioApp& app_;
 	Local<Graph> graph_;
 	bool is_open_ = false;
+	Path path_;
 	Action toggle_ui_;
 	i32 context_node_ = -1;
 	i32 context_link_ = -1;
