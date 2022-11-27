@@ -6,7 +6,6 @@
 #include "editor/utils.h"
 #include "editor/world_editor.h"
 #include "engine/allocator.h"
-#include "engine/crc32.h"
 #include "engine/engine.h"
 #include "engine/file_system.h"
 #include "engine/log.h"
@@ -20,12 +19,7 @@
 
 using namespace Lumix;
 
-struct Link {
-	u32 from;
-	u32 to;
-};
-
-static const u32 OUTPUT_FLAG = 1 << 15;
+static const u32 OUTPUT_FLAG = NodeEditor::OUTPUT_FLAG;
 
 struct Variable {
 	enum Type {
@@ -42,7 +36,7 @@ struct Variable {
 
 struct Graph;
 
-struct Node {
+struct Node : NodeEditorNode {
 	enum class Type : u32 {
 		ADD,
 		SEQUENCE,
@@ -60,31 +54,20 @@ struct Node {
 		YAW_TO_DIR
 	};
 
-	void onNodeGUI(Graph& graph) {
-		input_pin_counter_ = 0;
-		output_pin_counter_ = 0;
-		ImGuiEx::BeginNode(id_, pos_);
-		onGUI(graph);
+	bool nodeGUI() override {
+		m_input_pin_counter = 0;
+		m_output_pin_counter = 0;
+		ImGuiEx::BeginNode(m_id, m_pos, &m_selected);
+		onGUI();
 		ImGuiEx::EndNode();
+		return false;
 	}
-
+	
 	virtual Type getType() const = 0;
 
 	virtual void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) = 0;
-
-	virtual void serialize(OutputMemoryStream& blob) {
-		blob.write(id_);
-		blob.write(pos_);
-	}
-
-	virtual void deserialize(InputMemoryStream& blob) {
-		blob.read(id_);
-		blob.read(pos_);
-	}
-
-	u32 id_ = 0;
-	ImVec2 pos_ = ImVec2(0.f, 0.f);
-
+	virtual void serialize(OutputMemoryStream& blob) {}
+	virtual void deserialize(InputMemoryStream& blob) {}
 	virtual void printRef(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) {}
 
 protected:
@@ -103,37 +86,38 @@ protected:
 	NodeOutput getInputNode(u32 idx, const Graph& graph);
 
 	void inputPin() {
-		ImGuiEx::Pin(id_ | (input_pin_counter_ << 16), true);
-		++input_pin_counter_;
+		ImGuiEx::Pin(m_id | (m_input_pin_counter << 16), true);
+		++m_input_pin_counter;
 	}
 
 	void outputPin() {
-		ImGuiEx::Pin(id_ | (output_pin_counter_ << 16) | OUTPUT_FLAG, false);
-		++output_pin_counter_;
+		ImGuiEx::Pin(m_id | (m_output_pin_counter << 16) | OUTPUT_FLAG, false);
+		++m_output_pin_counter;
 	}
 
 	void flowInput() {
-		ImGuiEx::Pin(id_ | (input_pin_counter_ << 16), true, ImGuiEx::PinShape::TRIANGLE);
-		++input_pin_counter_;
+		ImGuiEx::Pin(m_id | (m_input_pin_counter << 16), true, ImGuiEx::PinShape::TRIANGLE);
+		++m_input_pin_counter;
 	}
 
 	void flowOutput() {
-		ImGuiEx::Pin(id_ | (output_pin_counter_ << 16) | OUTPUT_FLAG, false, ImGuiEx::PinShape::TRIANGLE);
-		++output_pin_counter_;
+		ImGuiEx::Pin(m_id | (m_output_pin_counter << 16) | OUTPUT_FLAG, false, ImGuiEx::PinShape::TRIANGLE);
+		++m_output_pin_counter;
 	}
 
-	virtual void onGUI(Graph& graph) = 0;
-	u32 input_pin_counter_ = 0;
-	u32 output_pin_counter_ = 0;
+	virtual void onGUI() = 0;
+	u32 m_input_pin_counter = 0;
+	u32 m_output_pin_counter = 0;
+	bool m_selected = false;
 };
 
 
 struct Graph {
 	Graph(IAllocator& allocator)
-		: allocator_(allocator)
-		, nodes_(allocator)
-		, links_(allocator)
-		, variables_(allocator)
+		: m_allocator(allocator)
+		, m_nodes(allocator)
+		, m_links(allocator)
+		, m_variables(allocator)
 	{}
 
 	static constexpr u32 MAGIC = '_LVS';
@@ -146,24 +130,26 @@ struct Graph {
 		
 		blob.read(node_counter_);
 		const u32 var_count = blob.read<u32>();
-		variables_.reserve(var_count);
+		m_variables.reserve(var_count);
 		for (u32 i = 0; i < var_count; ++i) {
-			Variable& var = variables_.emplace(allocator_);
+			Variable& var = m_variables.emplace(m_allocator);
 			var.name = blob.readString();
 		}
 
 		const u32 link_count = blob.read<u32>();
-		links_.reserve(link_count);
+		m_links.reserve(link_count);
 		for (u32 i = 0; i < link_count; ++i) {
-			Link& link = links_.emplace();
+			NodeEditorLink& link = m_links.emplace();
 			blob.read(link);
 		}
 
 		const u32 node_count = blob.read<u32>();
-		nodes_.reserve(node_count);
+		m_nodes.reserve(node_count);
 		for (u32 i = 0; i < node_count; ++i) {
 			const Node::Type type = blob.read<Node::Type>();
 			Node* n = createNode(type);
+			blob.read(n->m_id);
+			blob.read(n->m_pos);
 			n->deserialize(blob);
 		}
 		return true;
@@ -177,80 +163,85 @@ struct Graph {
 		blob.write(version);
 		blob.write(node_counter_);
 		
-		blob.write(variables_.size());
-		for (const Variable& var : variables_) {
+		blob.write(m_variables.size());
+		for (const Variable& var : m_variables) {
 			blob.writeString(var.name.c_str());
 		}
 
-		blob.write(links_.size());
-		for (const Link& link : links_) {
+		blob.write(m_links.size());
+		for (const NodeEditorLink& link : m_links) {
 			blob.write(link);
 		}
 
-		blob.write(nodes_.size());
-		for (const UniquePtr<Node>& node : nodes_) {
+		blob.write(m_nodes.size());
+		for (const UniquePtr<Node>& node : m_nodes) {
 			blob.write(node->getType());
+			blob.write(node->m_id);
+			blob.write(node->m_pos);
 			node->serialize(blob);
 		}
 	}
 
-	IAllocator& allocator_;
-	Array<UniquePtr<Node>> nodes_;
-	Array<Link> links_;
-	Array<Variable> variables_;
+	IAllocator& m_allocator;
+	Array<UniquePtr<Node>> m_nodes;
+	Array<NodeEditorLink> m_links;
+	Array<Variable> m_variables;
 
 	u32 node_counter_ = 0;
 	template <typename T, typename... Args>
 	Node* addNode(Args&&... args) {
-		UniquePtr<T> n = UniquePtr<T>::create(allocator_, static_cast<Args&&>(args)...);
-		n->id_ = ++node_counter_;
-		nodes_.push(n.move());
-		return nodes_.last().get();
+		UniquePtr<T> n = UniquePtr<T>::create(m_allocator, static_cast<Args&&>(args)...);
+		n->m_id = ++node_counter_;
+		m_nodes.push(n.move());
+		return m_nodes.last().get();
 	}
 
 	void removeNode(u32 node) {
-		const u32 node_id = nodes_[node]->id_;
-		for (i32 i = links_.size() - 1; i >= 0; --i) {
-			if ((links_[i].from & 0x7fff) == node_id || (links_[i].to & 0x7fff) == node_id) {
-				links_.erase(i);
+		const u32 node_id = m_nodes[node]->m_id;
+		for (i32 i = m_links.size() - 1; i >= 0; --i) {
+			if ((m_links[i].from & 0x7fff) == node_id || (m_links[i].to & 0x7fff) == node_id) {
+				m_links.erase(i);
 			}	
 		}
-		nodes_.erase(node);
+		m_nodes.erase(node);
 	}
 
 	void removeLink(u32 link) {
-		links_.erase(link);
+		m_links.erase(link);
 	}
 
 	Node* getNode(u32 id) const {
-		const i32 idx = nodes_.find([&](const UniquePtr<Node>& node){ return node->id_ == id; });
-		return idx < 0 ? nullptr : nodes_[idx].get();
+		const i32 idx = m_nodes.find([&](const UniquePtr<Node>& node){ return node->m_id == id; });
+		return idx < 0 ? nullptr : m_nodes[idx].get();
 	}
 };
 
 Node::NodeInput Node::getOutputNode(u32 idx, const Graph& graph) {
-	const i32 i = graph.links_.find([&](Link& l){
-		return l.from == (id_ | (idx << 16) | OUTPUT_FLAG);
+	const i32 i = graph.m_links.find([&](NodeEditorLink& l){
+		return l.from == (m_id | (idx << 16) | OUTPUT_FLAG);
 	});
 	if (i == -1) return {nullptr, 0};
 
-	const u32 to = graph.links_[i].to;
+	const u32 to = graph.m_links[i].to;
 	return { graph.getNode(to & 0x7fFF), to >> 16 };
 }
 
 Node::NodeOutput Node::getInputNode(u32 idx, const Graph& graph) {
-	const i32 i = graph.links_.find([&](Link& l){
-		return l.to == (id_ | (idx << 16));
+	const i32 i = graph.m_links.find([&](NodeEditorLink& l){
+		return l.to == (m_id | (idx << 16));
 	});
 	if (i == -1) return {nullptr, 0};
 
-	const u32 from = graph.links_[i].from;
+	const u32 from = graph.m_links[i].from;
 	return { graph.getNode(from & 0x7fFF), from >> 16 };
 }
 
 struct SequenceNode : Node {
 	Type getType() const override { return Type::SEQUENCE; }
-	void onGUI(Graph& graph) override {
+	bool hasInputPins() const override { return true; }
+	bool hasOutputPins() const override { return true; }
+
+	void onGUI() override {
 		flowInput(); ImGui::TextUnformatted(ICON_FA_LIST_OL);
 		ImGui::SameLine();
 		for (u32 i = 0; i < outputs_; ++i) {
@@ -266,7 +257,9 @@ struct SequenceNode : Node {
 
 struct SelfNode : Node {
 	Type getType() const override { return Type::SELF; }
-	void onGUI(Graph& graph) override {
+	bool hasInputPins() const override { return false; }
+	bool hasOutputPins() const override { return true; }
+	void onGUI() override {
 		outputPin();
 		ImGui::TextUnformatted("Self");
 	}
@@ -285,8 +278,7 @@ struct CallNode : Node {
 	{}
 
 	void deserialize(InputMemoryStream& blob) override {
-		Node::deserialize(blob);
-		const u32 cmp_name_hash = blob.read<u32>();
+		const RuntimeHash cmp_name_hash = blob.read<RuntimeHash>();
 		const char* func_name = blob.readString();
 		const ComponentType cmp_type = reflection::getComponentTypeFromHash(cmp_name_hash);
 		component = reflection::getComponent(cmp_type);
@@ -307,14 +299,16 @@ struct CallNode : Node {
 	}
 
 	void serialize(OutputMemoryStream& blob) override {
-		Node::serialize(blob);
-		blob.write(crc32(component->name));
+		blob.write(RuntimeHash(component->name));
 		blob.writeString(function->name);
 	}
 
 
 	Type getType() const override { return Type::CALL; }
-	void onGUI(Graph& graph) override {
+	bool hasInputPins() const override { return true; }
+	bool hasOutputPins() const override { return true; }
+
+	void onGUI() override {
 		flowInput();
 		ImGui::Text("%s.%s", component->name, function->name);
 		ImGui::SameLine();
@@ -332,7 +326,10 @@ struct CallNode : Node {
 
 struct SetYawNode : Node {
 	Type getType() const override { return Type::SET_YAW; }
-	void onGUI(Graph& graph) override {
+	bool hasInputPins() const override { return true; }
+	bool hasOutputPins() const override { return true; }
+
+	void onGUI() override {
 		flowInput(); ImGui::TextUnformatted("Set Yaw");
 		ImGui::SameLine();
 		flowOutput(); ImGui::NewLine();
@@ -360,7 +357,10 @@ struct SetYawNode : Node {
 
 struct ConstNode : Node {
 	Type getType() const override { return Type::CONST; }
-	void onGUI(Graph& graph) override {
+	bool hasInputPins() const override { return false; }
+	bool hasOutputPins() const override { return true; }
+
+	void onGUI() override {
 		outputPin();
 		ImGui::DragFloat("##v", &value_);
 	}
@@ -375,7 +375,10 @@ struct ConstNode : Node {
 
 struct MouseMoveNode : Node {
 	Type getType() const override { return Type::MOUSE_MOVE; }
-	void onGUI(Graph& graph) override {
+	bool hasInputPins() const override { return false; }
+	bool hasOutputPins() const override { return true; }
+
+	void onGUI() override {
 		flowOutput(); ImGui::TextUnformatted(ICON_FA_MOUSE " Mouse move");
 		outputPin(); ImGui::TextUnformatted("Delta X");
 		outputPin(); ImGui::TextUnformatted("Delta Y");
@@ -405,7 +408,10 @@ struct MouseMoveNode : Node {
 
 struct Vec3Node : Node {
 	Type getType() const override { return Type::VEC3; }
-	void onGUI(Graph& graph) override {
+	bool hasInputPins() const override { return true; }
+	bool hasOutputPins() const override { return true; }
+
+	void onGUI() override {
 		ImGui::BeginGroup();
 		inputPin(); ImGui::TextUnformatted("X");
 		inputPin(); ImGui::TextUnformatted("Y");
@@ -419,7 +425,10 @@ struct Vec3Node : Node {
 
 struct YawToDirNode : Node {
 	Type getType() const override { return Type::YAW_TO_DIR; }
-	void onGUI(Graph& graph) override {
+	bool hasInputPins() const override { return true; }
+	bool hasOutputPins() const override { return true; }
+
+	void onGUI() override {
 		inputPin(); ImGui::TextUnformatted("Yaw to dir");
 		ImGui::SameLine();
 		outputPin();
@@ -429,7 +438,10 @@ struct YawToDirNode : Node {
 
 struct UpdateNode : Node {
 	Type getType() const override { return Type::UPDATE; }
-	void onGUI(Graph& graph) override {
+	bool hasInputPins() const override { return false; }
+	bool hasOutputPins() const override { return true; }
+
+	void onGUI() override {
 		flowOutput();
 		ImGui::TextUnformatted(ICON_FA_CLOCK "Update");
 		outputPin();
@@ -446,6 +458,8 @@ struct UpdateNode : Node {
 
 struct MulNode : Node {
 	Type getType() const override { return Type::MUL; }
+	bool hasInputPins() const override { return true; }
+	bool hasOutputPins() const override { return true; }
 
 	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
 		NodeOutput n0 = getInputNode(0, graph);
@@ -455,7 +469,7 @@ struct MulNode : Node {
 		n0.node->generate(blob, graph, n0.output_idx);
 		n1.node->generate(blob, graph, n1.output_idx);
 
-		blob << "local v" << id_ << " = ";
+		blob << "local v" << m_id << " = ";
 		n0.node->printRef(blob, graph, n0.output_idx);
 		blob << " * ";
 		n1.node->printRef(blob, graph, n0.output_idx);
@@ -463,10 +477,10 @@ struct MulNode : Node {
 	}
 
 	void printRef(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {
-		blob << "v" << id_;
+		blob << "v" << m_id;
 	}
 
-	void onGUI(Graph& graph) override {
+	void onGUI() override {
 		ImGui::BeginGroup();
 		inputPin(); ImGui::NewLine();
 		inputPin(); ImGui::NewLine();
@@ -483,6 +497,9 @@ struct MulNode : Node {
 struct AddNode : Node {
 	Type getType() const override { return Type::ADD; }
 
+	bool hasInputPins() const override { return true; }
+	bool hasOutputPins() const override { return true; }
+
 	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
 		NodeOutput n0 = getInputNode(0, graph);
 		NodeOutput n1 = getInputNode(1, graph);
@@ -491,7 +508,7 @@ struct AddNode : Node {
 		n0.node->generate(blob, graph, n0.output_idx);
 		n1.node->generate(blob, graph, n1.output_idx);
 
-		blob << "local v" << id_ << " = ";
+		blob << "local v" << m_id << " = ";
 		n0.node->printRef(blob, graph, n0.output_idx);
 		blob << " + ";
 		n1.node->printRef(blob, graph, n0.output_idx);
@@ -499,10 +516,10 @@ struct AddNode : Node {
 	}
 
 	void printRef(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {
-		blob << "v" << id_;
+		blob << "v" << m_id;
 	}
 
-	void onGUI(Graph& graph) override {
+	void onGUI() override {
 		ImGui::BeginGroup();
 		inputPin(); ImGui::NewLine();
 		inputPin(); ImGui::NewLine();
@@ -517,20 +534,23 @@ struct AddNode : Node {
 };
 
 struct SetVariableNode : Node {
-	SetVariableNode() {}
-	SetVariableNode(u32 var) : var_(var) {}
+	SetVariableNode(Graph& graph) : m_graph(graph) {}
+	SetVariableNode(Graph& graph, u32 var) : m_graph(graph), m_var(var) {}
+
+	bool hasInputPins() const override { return true; }
+	bool hasOutputPins() const override { return true; }
 
 	Type getType() const override { return Type::SET_VARIABLE; }
 
 	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
-		if (var_ >= (u32)graph.variables_.size()) return;
+		if (m_var >= (u32)graph.m_variables.size()) return;
 		
 		const NodeOutput n = getInputNode(1, graph);
 		if (!n.node) return;
 
 		n.node->generate(blob, graph, n.output_idx);
 
-		blob << graph.variables_[var_].name.c_str() << " = ";
+		blob << graph.m_variables[m_var].name.c_str() << " = ";
 		n.node->printRef(blob, graph, n.output_idx);
 		blob << "\n";
 
@@ -540,45 +560,53 @@ struct SetVariableNode : Node {
 		on.node->generate(blob, graph, on.input_idx);
 	}
 
-	void onGUI(Graph& graph) override {
-		const char* var_name = var_ < (u32)graph.variables_.size() ? graph.variables_[var_].name.c_str() : "N/A";
+	void onGUI() override {
+		const char* var_name = m_var < (u32)m_graph.m_variables.size() ? m_graph.m_variables[m_var].name.c_str() : "N/A";
 		flowInput(); ImGui::Text("Set `%s`", var_name);
 		ImGui::SameLine();
 		flowOutput(); ImGui::NewLine();
 		inputPin(); ImGui::TextUnformatted("Value");
 	}
 
-	u32 var_ = 0;
+	Graph& m_graph;
+	u32 m_var = 0;
 };
 
 struct GetVariableNode : Node {
-	GetVariableNode() {}
-	GetVariableNode(u32 var) : var_(var) {}
+	GetVariableNode(Graph& graph) : m_graph(graph) {}
+	GetVariableNode(Graph& graph, u32 var) : m_graph(graph), m_var(var) {}
 	Type getType() const override { return Type::GET_VARIABLE; }
+	bool hasInputPins() const override { return false; }
+	bool hasOutputPins() const override { return true; }
+
 	void generate(OutputMemoryStream& blob, const Graph&, u32) override {}
 	
 	void printRef(OutputMemoryStream& blob, const Graph& graph, u32) override {
-		if (var_ >= (u32)graph.variables_.size()) return;
-		blob << graph.variables_[var_].name.c_str();
+		if (m_var >= (u32)m_graph.m_variables.size()) return;
+		blob << m_graph.m_variables[m_var].name.c_str();
 	}
 
-	void onGUI(Graph& graph) override {
+	void onGUI() override {
 		outputPin();
-		const char* var_name = var_ < (u32)graph.variables_.size() ? graph.variables_[var_].name.c_str() : "N/A";
+		const char* var_name = m_var < (u32)m_graph.m_variables.size() ? m_graph.m_variables[m_var].name.c_str() : "N/A";
 		ImGui::Text(ICON_FA_PENCIL_ALT " %s", var_name);
 	}
 
-	u32 var_ = 0;
+	Graph& m_graph;
+	u32 m_var = 0;
 };
 
 struct SetPropertyNode : Node {
 	Type getType() const override { return Type::SET_PROPERTY; }
+	bool hasInputPins() const override { return true; }
+	bool hasOutputPins() const override { return true; }
+
 	void generate(OutputMemoryStream& blob, const Graph&, u32) override {
 //		getInput(1)->generate(blob);
 		blob << "." << cmp << "." << prop << " = " << value;
 	}
 
-	void onGUI(Graph& graph) override {
+	void onGUI() override {
 		flowInput(); ImGui::TextUnformatted("Set property");
 		ImGui::SameLine();
 		flowOutput(); ImGui::NewLine();
@@ -631,11 +659,11 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 		if (!Path::replaceExtension(path, "lua")) return;
 
 		OutputMemoryStream blob(app_.getAllocator());
-		for (Variable& var : graph_->variables_) {
+		for (Variable& var : graph_->m_variables) {
 			blob << "local " << var.name.c_str() << " = 0\n";
 		}
 		
-		for (UniquePtr<Node>& node : graph_->nodes_) {
+		for (UniquePtr<Node>& node : graph_->m_nodes) {
 			if (node->getType() == Node::Type::MOUSE_MOVE) {
 				node->generate(blob, *graph_.get(), 0);
 			}
@@ -748,10 +776,10 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 			menu();
 			ImGui::Columns(2);
 			static bool once = [](){ ImGui::SetColumnWidth(-1, 150); return true; }();
-			for (Variable& var : graph_->variables_) {
+			for (Variable& var : graph_->m_variables) {
 				ImGui::PushID(&var);
 				if (ImGuiEx::IconButton(ICON_FA_TRASH, "Delete")) {
-					graph_->variables_.erase(u32(&var - graph_->variables_.begin()));
+					graph_->m_variables.erase(u32(&var - graph_->m_variables.begin()));
 					ImGui::PopID();
 					break;
 				}
@@ -765,7 +793,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 				ImGui::PopID();
 			}
 			if (ImGui::Button(ICON_FA_PLUS " Add variable")) {
-				graph_->variables_.emplace(app_.getAllocator());
+				graph_->m_variables.emplace(app_.getAllocator());
 			}
 			
 			ImGui::NextColumn();
@@ -773,23 +801,23 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 			const ImVec2 editor_pos = ImGui::GetCursorScreenPos();
 			ImGuiEx::BeginNodeEditor("vs", &offset);
 			
-			for (UniquePtr<Node>& node : graph_->nodes_) {
-				node->onNodeGUI(*graph_.get());
+			for (UniquePtr<Node>& node : graph_->m_nodes) {
+				node->nodeGUI();
 				if (ImGui::IsItemHovered()) {
-					hovered_node = i32(&node - graph_->nodes_.begin());
+					hovered_node = i32(&node - graph_->m_nodes.begin());
 				}
 			}
 
-			for (const Link& link : graph_->links_) {
+			for (const NodeEditorLink& link : graph_->m_links) {
 				ImGuiEx::NodeLink(link.from, link.to);
 				if (ImGuiEx::IsLinkHovered()) {
-					hovered_link = i32(&link - graph_->links_.begin());
+					hovered_link = i32(&link - graph_->m_links.begin());
 				}
 			}
 
 			ImGuiID link_from, link_to;
 			if (ImGuiEx::GetNewLink(&link_from, &link_to)) {
-				Link& link = graph_->links_.emplace();
+				NodeEditorLink& link = graph_->m_links.emplace();
 				link.from = link_from;
 				link.to = link_to;
 			}
@@ -817,17 +845,17 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 			if (ImGui::Selectable("Add")) n = graph_->addNode<AddNode>();
 			if (ImGui::Selectable("Multiply")) n = graph_->addNode<MulNode>();
 			if (ImGui::BeginMenu("Set variable")) {
-				for (const Variable& var : graph_->variables_) {
+				for (const Variable& var : graph_->m_variables) {
 					if (var.name.length() > 0 && ImGui::Selectable(var.name.c_str())) {
-						n = graph_->addNode<SetVariableNode>(u32(&var - graph_->variables_.begin()));
+						n = graph_->addNode<SetVariableNode>(*graph_, u32(&var - graph_->m_variables.begin()));
 					}
 				}
 				ImGui::EndMenu();
 			}
 			if (ImGui::BeginMenu("Get variable")) {
-				for (const Variable& var : graph_->variables_) {
+				for (const Variable& var : graph_->m_variables) {
 					if (var.name.length() > 0 && ImGui::Selectable(var.name.c_str())) {
-						n = graph_->addNode<GetVariableNode>(u32(&var - graph_->variables_.begin()));
+						n = graph_->addNode<GetVariableNode>(*graph_, u32(&var - graph_->m_variables.begin()));
 					}
 				}
 				ImGui::EndMenu();
@@ -842,7 +870,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 			if (ImGui::Selectable("Yaw to direction")) n = graph_->addNode<YawToDirNode>();
 			if (ImGui::Selectable("Sequence")) n = graph_->addNode<SequenceNode>();
 			if (n) {
-				n->pos_ = ImGui::GetMousePos() - editor_pos;
+				n->m_pos = ImGui::GetMousePos() - editor_pos;
 			}
 			ImGui::EndMenu();
 		}
@@ -893,8 +921,8 @@ Node* Graph::createNode(Node::Type type) {
 		case Node::Type::UPDATE: return addNode<UpdateNode>();
 		case Node::Type::VEC3: return addNode<Vec3Node>();
 		case Node::Type::CALL: return addNode<CallNode>();
-		case Node::Type::GET_VARIABLE: return addNode<GetVariableNode>();
-		case Node::Type::SET_VARIABLE: return addNode<SetVariableNode>();
+		case Node::Type::GET_VARIABLE: return addNode<GetVariableNode>(*this);
+		case Node::Type::SET_VARIABLE: return addNode<SetVariableNode>(*this);
 		case Node::Type::SET_PROPERTY: return addNode<SetPropertyNode>();
 		case Node::Type::YAW_TO_DIR: return addNode<YawToDirNode>();
 
