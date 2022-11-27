@@ -51,25 +51,35 @@ struct Node : NodeEditorNode {
 		MUL,
 		CALL,
 		VEC3,
-		YAW_TO_DIR
+		YAW_TO_DIR,
+		START
 	};
 
 	bool nodeGUI() override {
 		m_input_pin_counter = 0;
 		m_output_pin_counter = 0;
 		ImGuiEx::BeginNode(m_id, m_pos, &m_selected);
-		onGUI();
+		bool res = onGUI();
 		ImGuiEx::EndNode();
-		return false;
+		return res;
 	}
 	
+	void nodeTitle(const char* title, bool input_flow, bool output_flow) {
+		ImGuiEx::BeginNodeTitleBar();
+		if (input_flow) flowInput();
+		if (output_flow) flowOutput();
+		ImGui::TextUnformatted(title);
+		ImGuiEx::EndNodeTitleBar();
+	}
+
 	virtual Type getType() const = 0;
 
 	virtual void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) = 0;
-	virtual void serialize(OutputMemoryStream& blob) {}
+	virtual void serialize(OutputMemoryStream& blob) const {}
 	virtual void deserialize(InputMemoryStream& blob) {}
 	virtual void printRef(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) {}
 
+	bool m_selected = false;
 protected:
 	struct NodeInput {
 		Node* node;
@@ -105,10 +115,9 @@ protected:
 		++m_output_pin_counter;
 	}
 
-	virtual void onGUI() = 0;
+	virtual bool onGUI() = 0;
 	u32 m_input_pin_counter = 0;
 	u32 m_output_pin_counter = 0;
-	bool m_selected = false;
 };
 
 
@@ -174,7 +183,7 @@ struct Graph {
 		}
 
 		blob.write(m_nodes.size());
-		for (const UniquePtr<Node>& node : m_nodes) {
+		for (const Node* node : m_nodes) {
 			blob.write(node->getType());
 			blob.write(node->m_id);
 			blob.write(node->m_pos);
@@ -183,17 +192,17 @@ struct Graph {
 	}
 
 	IAllocator& m_allocator;
-	Array<UniquePtr<Node>> m_nodes;
+	Array<Node*> m_nodes;
 	Array<NodeEditorLink> m_links;
 	Array<Variable> m_variables;
 
 	u32 node_counter_ = 0;
 	template <typename T, typename... Args>
 	Node* addNode(Args&&... args) {
-		UniquePtr<T> n = UniquePtr<T>::create(m_allocator, static_cast<Args&&>(args)...);
+		Node* n = LUMIX_NEW(m_allocator, T)(static_cast<Args&&>(args)...);
 		n->m_id = ++node_counter_;
-		m_nodes.push(n.move());
-		return m_nodes.last().get();
+		m_nodes.push(n);
+		return n;
 	}
 
 	void removeNode(u32 node) {
@@ -211,14 +220,14 @@ struct Graph {
 	}
 
 	Node* getNode(u32 id) const {
-		const i32 idx = m_nodes.find([&](const UniquePtr<Node>& node){ return node->m_id == id; });
-		return idx < 0 ? nullptr : m_nodes[idx].get();
+		const i32 idx = m_nodes.find([&](const Node* node){ return node->m_id == id; });
+		return idx < 0 ? nullptr : m_nodes[idx];
 	}
 };
 
 Node::NodeInput Node::getOutputNode(u32 idx, const Graph& graph) {
 	const i32 i = graph.m_links.find([&](NodeEditorLink& l){
-		return l.from == (m_id | (idx << 16) | OUTPUT_FLAG);
+		return l.getFromNode() == m_id && l.getFromPin() == idx;
 	});
 	if (i == -1) return {nullptr, 0};
 
@@ -237,31 +246,37 @@ Node::NodeOutput Node::getInputNode(u32 idx, const Graph& graph) {
 }
 
 struct SequenceNode : Node {
+	SequenceNode(Graph& graph) : m_graph(graph) {}
 	Type getType() const override { return Type::SEQUENCE; }
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
 
-	void onGUI() override {
+	bool onGUI() override {
 		flowInput(); ImGui::TextUnformatted(ICON_FA_LIST_OL);
 		ImGui::SameLine();
-		for (u32 i = 0; i < outputs_; ++i) {
+		u32 count = 0;
+		for (const NodeEditorLink& link : m_graph.m_links) {
+			if (link.getFromNode() == m_id) count = maximum(count, link.getFromPin() + 1);
+		}
+		for (u32 i = 0; i < count; ++i) {
 			flowOutput();ImGui::NewLine();
 		}
-		if (ImGuiEx::IconButton(ICON_FA_PLUS, "Add")) ++outputs_;
+		flowOutput();ImGui::NewLine();
+		return false;
 	}
 	
 	void generate(OutputMemoryStream& blob, const Graph&, u32) override {}
-
-	u32 outputs_ = 2;
+	Graph& m_graph;
 };
 
 struct SelfNode : Node {
 	Type getType() const override { return Type::SELF; }
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
-	void onGUI() override {
+	bool onGUI() override {
 		outputPin();
 		ImGui::TextUnformatted("Self");
+		return false;
 	}
 	
 	void generate(OutputMemoryStream& blob, const Graph&, u32) override {}
@@ -298,7 +313,7 @@ struct CallNode : Node {
 		}
 	}
 
-	void serialize(OutputMemoryStream& blob) override {
+	void serialize(OutputMemoryStream& blob) const override {
 		blob.write(RuntimeHash(component->name));
 		blob.writeString(function->name);
 	}
@@ -308,7 +323,7 @@ struct CallNode : Node {
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
 
-	void onGUI() override {
+	bool onGUI() override {
 		flowInput();
 		ImGui::Text("%s.%s", component->name, function->name);
 		ImGui::SameLine();
@@ -317,6 +332,7 @@ struct CallNode : Node {
 		for (u32 i = 0; i < function->getArgCount(); ++i) {
 			inputPin(); ImGui::Text("Input %d", i);
 		}
+		return false;
 	}
 	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {}
 
@@ -329,12 +345,11 @@ struct SetYawNode : Node {
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
 
-	void onGUI() override {
-		flowInput(); ImGui::TextUnformatted("Set Yaw");
-		ImGui::SameLine();
-		flowOutput(); ImGui::NewLine();
+	bool onGUI() override {
+		nodeTitle("Set entity yaw", true, true);
 		inputPin(); ImGui::TextUnformatted("Entity");
 		inputPin(); ImGui::TextUnformatted("Yaw");
+		return false;
 	}
 
 	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
@@ -360,9 +375,9 @@ struct ConstNode : Node {
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
 
-	void onGUI() override {
+	bool onGUI() override {
 		outputPin();
-		ImGui::DragFloat("##v", &value_);
+		return ImGui::DragFloat("##v", &value_);
 	}
 
 	void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {}
@@ -378,10 +393,11 @@ struct MouseMoveNode : Node {
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
 
-	void onGUI() override {
-		flowOutput(); ImGui::TextUnformatted(ICON_FA_MOUSE " Mouse move");
+	bool onGUI() override {
+		nodeTitle(ICON_FA_MOUSE " Mouse move", false, true);
 		outputPin(); ImGui::TextUnformatted("Delta X");
 		outputPin(); ImGui::TextUnformatted("Delta Y");
+		return false;
 	}
 	
 	void printRef(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {
@@ -411,7 +427,7 @@ struct Vec3Node : Node {
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
 
-	void onGUI() override {
+	bool onGUI() override {
 		ImGui::BeginGroup();
 		inputPin(); ImGui::TextUnformatted("X");
 		inputPin(); ImGui::TextUnformatted("Y");
@@ -419,6 +435,7 @@ struct Vec3Node : Node {
 		ImGui::EndGroup();
 		ImGui::SameLine();
 		outputPin();
+		return false;
 	}
 	void generate(OutputMemoryStream& blob, const Graph&, u32) override {}
 };
@@ -428,12 +445,34 @@ struct YawToDirNode : Node {
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
 
-	void onGUI() override {
+	bool onGUI() override {
 		inputPin(); ImGui::TextUnformatted("Yaw to dir");
 		ImGui::SameLine();
 		outputPin();
+		return false;
 	}
+
 	void generate(OutputMemoryStream& blob, const Graph&, u32) override {}
+};
+
+struct StartNode : Node {
+	Type getType() const override { return Type::START; }
+	bool hasInputPins() const override { return false; }
+	bool hasOutputPins() const override { return true; }
+
+	bool onGUI() override {
+		nodeTitle(ICON_FA_PLAY "Start", false, true);
+		return false;
+	}
+
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32 pin_idx) override {
+		if (pin_idx == 0) {
+			blob << "function start()\n";
+			NodeInput o = getOutputNode(0, graph);
+			if (o.node) o.node->generate(blob, graph, o.input_idx);
+			blob << "end\n";
+		}
+	}
 };
 
 struct UpdateNode : Node {
@@ -441,17 +480,24 @@ struct UpdateNode : Node {
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
 
-	void onGUI() override {
-		flowOutput();
-		ImGui::TextUnformatted(ICON_FA_CLOCK "Update");
+	bool onGUI() override {
+		nodeTitle(ICON_FA_CLOCK "Update", false, true);
 		outputPin();
 		ImGui::TextUnformatted("Time delta");
+		return false;
 	}
 
-	void generate(OutputMemoryStream& blob, const Graph&, u32) override {
-		blob << "function update(td)\n";
-		//getOutput(0)->generate(blob);
-		blob << "end\n";
+	void printRef(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {
+		blob << "td";
+	}
+
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32 pin_idx) override {
+		if (pin_idx == 0) {
+			blob << "function update(td)\n";
+			NodeInput o = getOutputNode(0, graph);
+			if(o.node) o.node->generate(blob, graph, o.input_idx);
+			blob << "end\n";
+		}
 	}
 };
 
@@ -480,7 +526,7 @@ struct MulNode : Node {
 		blob << "v" << m_id;
 	}
 
-	void onGUI() override {
+	bool onGUI() override {
 		ImGui::BeginGroup();
 		inputPin(); ImGui::NewLine();
 		inputPin(); ImGui::NewLine();
@@ -491,6 +537,7 @@ struct MulNode : Node {
 
 		ImGui::SameLine();
 		outputPin();
+		return false;
 	}
 };
 
@@ -507,19 +554,18 @@ struct AddNode : Node {
 
 		n0.node->generate(blob, graph, n0.output_idx);
 		n1.node->generate(blob, graph, n1.output_idx);
-
-		blob << "local v" << m_id << " = ";
-		n0.node->printRef(blob, graph, n0.output_idx);
-		blob << " + ";
-		n1.node->printRef(blob, graph, n0.output_idx);
-		blob << "\n";
 	}
 
 	void printRef(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {
-		blob << "v" << m_id;
+		NodeOutput n0 = getInputNode(0, graph);
+		NodeOutput n1 = getInputNode(1, graph);
+		if (!n0.node || !n1.node) return;
+		n0.node->printRef(blob, graph, n0.output_idx);
+		blob << " + ";
+		n1.node->printRef(blob, graph, n0.output_idx);
 	}
 
-	void onGUI() override {
+	bool onGUI() override {
 		ImGui::BeginGroup();
 		inputPin(); ImGui::NewLine();
 		inputPin(); ImGui::NewLine();
@@ -530,6 +576,7 @@ struct AddNode : Node {
 
 		ImGui::SameLine();
 		outputPin();
+		return false;
 	}
 };
 
@@ -560,12 +607,16 @@ struct SetVariableNode : Node {
 		on.node->generate(blob, graph, on.input_idx);
 	}
 
-	void onGUI() override {
+	bool onGUI() override {
+		ImGuiEx::BeginNodeTitleBar();
+		flowInput();
+		flowOutput();
 		const char* var_name = m_var < (u32)m_graph.m_variables.size() ? m_graph.m_variables[m_var].name.c_str() : "N/A";
-		flowInput(); ImGui::Text("Set `%s`", var_name);
-		ImGui::SameLine();
-		flowOutput(); ImGui::NewLine();
+		ImGui::Text("Set " ICON_FA_PENCIL_ALT " %s", var_name);
+		ImGuiEx::EndNodeTitleBar();
+
 		inputPin(); ImGui::TextUnformatted("Value");
+		return false;
 	}
 
 	Graph& m_graph;
@@ -586,10 +637,11 @@ struct GetVariableNode : Node {
 		blob << m_graph.m_variables[m_var].name.c_str();
 	}
 
-	void onGUI() override {
+	bool onGUI() override {
 		outputPin();
 		const char* var_name = m_var < (u32)m_graph.m_variables.size() ? m_graph.m_variables[m_var].name.c_str() : "N/A";
 		ImGui::Text(ICON_FA_PENCIL_ALT " %s", var_name);
+		return false;
 	}
 
 	Graph& m_graph;
@@ -601,185 +653,300 @@ struct SetPropertyNode : Node {
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
 
-	void generate(OutputMemoryStream& blob, const Graph&, u32) override {
-//		getInput(1)->generate(blob);
-		blob << "." << cmp << "." << prop << " = " << value;
+	static bool propertyInput(const char* label, ComponentType* type, Span<char> property_name) {
+		bool res = false;
+		StaticString<128> preview;
+		if (*type == INVALID_COMPONENT_TYPE) preview = "Not set";
+		else {
+			preview = reflection::getComponent(*type)->name;
+			preview.add(".");
+			preview.add(property_name);
+		}
+		if (ImGui::BeginCombo(label, preview)) {
+			static char filter[32] = "";
+			ImGui::SetNextItemWidth(150);
+			ImGui::InputTextWithHint("##filter", "Filter", filter, sizeof(filter));
+			for (const reflection::RegisteredComponent& cmp : reflection::getComponents()) {
+				struct : reflection::IEmptyPropertyVisitor {
+					void visit(const reflection::Property<float>& prop) override {
+						StaticString<128> tmp(cmp_name, ".", prop.name);
+						if ((!filter[0] || stristr(tmp, filter)) && ImGui::Selectable(tmp)) {
+							selected = true;
+							copyString(property_name, prop.name);
+						}
+					}
+					const char* filter;
+					const char* cmp_name;
+					bool selected = false;
+					Span<char> property_name;
+				} visitor;
+				visitor.filter = filter;
+				visitor.property_name = property_name;
+				visitor.cmp_name = cmp.cmp->name;
+				cmp.cmp->visit(visitor);
+				if (visitor.selected) {
+					res = visitor.selected;
+					*type = cmp.cmp->component_type;
+				}
+			}
+			ImGui::EndCombo();
+		}
+		return res;
 	}
 
-	void onGUI() override {
-		flowInput(); ImGui::TextUnformatted("Set property");
-		ImGui::SameLine();
-		flowOutput(); ImGui::NewLine();
+	void generate(OutputMemoryStream& blob, const Graph&, u32) override {
+		// TODO name to propertyname 
+		blob << "." << reflection::getComponent(cmp_type)->name << "." << prop << " = " << value;
+	}
+
+	bool onGUI() override {
+		nodeTitle("Set property", true, true);
 		
 		inputPin();
 		ImGui::TextUnformatted("Entity");
-
-		ImGui::InputText("Component", cmp, sizeof(cmp));
-		ImGui::InputText("Property", prop, sizeof(prop));
-		
+		ImGui::PushItemWidth(150);
+		bool res = propertyInput("Property", &cmp_type, Span(prop));
 		inputPin();
-		ImGui::InputText("Value", value, sizeof(value));
+		res = ImGui::InputText("Value", value, sizeof(value)) || res;
+		ImGui::PopItemWidth();
+		return res;
 	}
 	
 	char prop[64] = {};
 	char value[64] = {};
-	char cmp[64] = {};
+	ComponentType cmp_type = INVALID_COMPONENT_TYPE;
 };
 
-struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
+struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 	VisualScriptEditorPlugin (StudioApp& app) 
-		: app_(app)
+		: NodeEditor(app.getAllocator())	
+		, m_app(app)
 	{
-		toggle_ui_.init("Visual Script Editor", "Toggle visual script editor", "visualScriptEditor", "", true);
-		toggle_ui_.func.bind<&VisualScriptEditorPlugin::onAction>(this);
-		toggle_ui_.is_selected.bind<&VisualScriptEditorPlugin::isOpen>(this);
-		app.addWindowAction(&toggle_ui_);
-		is_open_ = false;
-		graph_.create(app.getAllocator());
+		m_toggle_ui.init("Visual Script Editor", "Toggle visual script editor", "visualScriptEditor", "", true);
+		m_toggle_ui.func.bind<&VisualScriptEditorPlugin::onToggleUI>(this);
+		m_toggle_ui.is_selected.bind<&VisualScriptEditorPlugin::isOpen>(this);
+		
+		m_save_action.init(ICON_FA_SAVE "Save", "Visual script save", "visual_script_editor_save", ICON_FA_SAVE, os::Keycode::S, Action::Modifiers::CTRL, true);
+		m_save_action.func.bind<&VisualScriptEditorPlugin::save>(this);
+		m_save_action.plugin = this;
+		
+		m_generate_action.init(ICON_FA_CHECK "Generate", "Visual script generate", "visual_script_editor_generate", ICON_FA_CHECK, os::Keycode::E, Action::Modifiers::CTRL, true);
+		m_generate_action.func.bind<&VisualScriptEditorPlugin::generate>(this);
+		m_generate_action.plugin = this;
+		
+		m_undo_action.init(ICON_FA_UNDO "Undo", "Visual script undo", "visual_script_editor_undo", ICON_FA_UNDO, os::Keycode::Z, Action::Modifiers::CTRL, true);
+		m_undo_action.func.bind<&VisualScriptEditorPlugin::undo>((SimpleUndoRedo*)this);
+		m_undo_action.plugin = this;
+
+		m_redo_action.init(ICON_FA_REDO "Redo", "Visual script redo", "visual_script_editor_redo", ICON_FA_REDO, os::Keycode::Z, Action::Modifiers::CTRL | Action::Modifiers::SHIFT, true);
+		m_redo_action.func.bind<&VisualScriptEditorPlugin::redo>((SimpleUndoRedo*)this);
+		m_redo_action.plugin = this;
+
+		m_delete_action.init(ICON_FA_TRASH "Delete", "Visual script delete", "visual_script_editor_delete", ICON_FA_TRASH, os::Keycode::DEL, Action::Modifiers::NONE, true);
+		m_delete_action.func.bind<&VisualScriptEditorPlugin::deleteSelectedNodes>(this);
+		m_delete_action.plugin = this;
+		
+		app.addAction(&m_save_action);
+		app.addAction(&m_generate_action);
+		app.addAction(&m_undo_action);
+		app.addAction(&m_redo_action);
+		app.addAction(&m_delete_action);
+		app.addWindowAction(&m_toggle_ui);
+		newGraph();
 	}
 	
 	~VisualScriptEditorPlugin() {
-		app_.removeAction(&toggle_ui_);
+		m_app.removeAction(&m_toggle_ui);
+		m_app.removeAction(&m_save_action);
+		m_app.removeAction(&m_generate_action);
+		m_app.removeAction(&m_undo_action);
+		m_app.removeAction(&m_redo_action);
+		m_app.removeAction(&m_delete_action);
 	}
 
-	void onAction() { is_open_ = !is_open_; }
-	bool isOpen() const { return is_open_; }
+	bool hasFocus() override { return m_has_focus; }
+	
+	void deleteSelectedNodes() {
+		for (i32 i = m_graph->m_nodes.size() - 1; i >= 0; --i) {
+			Node* node = m_graph->m_nodes[i];
+			if (node->m_selected) {
+				for (i32 j = m_graph->m_links.size() - 1; j >= 0; --j) {
+					if (m_graph->m_links[j].getFromNode() == node->m_id || m_graph->m_links[j].getToNode() == node->m_id) {
+						m_graph->m_links.erase(j);
+					}
+				}
+
+				LUMIX_DELETE(m_graph->m_allocator, node);
+				m_graph->m_nodes.swapAndPop(i);
+			}
+		}
+		pushUndo(NO_MERGE_UNDO);
+	}
+
+	void onCanvasClicked(ImVec2 pos, i32 hovered_link) override {
+		static struct {
+			char key;
+			const char* label;
+			Node::Type type;
+		} TYPES[] = {
+			{ '1', "Const", Node::Type::CONST },
+			{ '3', "Vec3", Node::Type::VEC3 },
+			{ 'A', "Add", Node::Type::ADD },
+			{ 'C', "Call", Node::Type::MUL },
+			{ 'M', "Multiply", Node::Type::MUL },
+			{ 'T', "Self", Node::Type::SELF },
+			{ 'S', "Sequence", Node::Type::SEQUENCE },
+			{ 'P', "Set property", Node::Type::SET_PROPERTY },
+		};
+
+		for (const auto& t : TYPES) {
+			if (os::isKeyDown((os::Keycode)t.key)) {
+				Node* n = m_graph->createNode(t.type);
+				n->m_pos = pos;
+				if (hovered_link >= 0) splitLink(m_graph->m_nodes.back(), m_graph->m_links, hovered_link);
+				pushUndo(NO_MERGE_UNDO);
+				break;
+			}
+		}
+	}
+	
+	void onLinkDoubleClicked(NodeEditorLink& link, ImVec2 pos) override {}
+	
+	void deserialize(InputMemoryStream& blob) override {
+		m_graph.destroy();
+		m_graph.create(m_app.getAllocator());
+		m_graph->deserialize(blob);
+	}
+
+	void serialize(OutputMemoryStream& blob) override {
+		m_graph->serialize(blob);
+	}
+
+	void onToggleUI() { m_is_open = !m_is_open; }
+	bool isOpen() const { return m_is_open; }
 
 	void onSettingsLoaded() override {
-		is_open_ = app_.getSettings().getValue(Settings::GLOBAL, "is_visualscript_editor_open", false);
+		m_is_open = m_app.getSettings().getValue(Settings::GLOBAL, "is_visualscript_editor_open", false);
 	}
 
 	void onBeforeSettingsSaved() override {
-		app_.getSettings().setValue(Settings::GLOBAL, "is_visualscript_editor_open", is_open_);
+		m_app.getSettings().setValue(Settings::GLOBAL, "is_visualscript_editor_open", m_is_open);
 	}
 
 	void generate() {
 		char path[LUMIX_MAX_PATH];
-		copyString(path, path_.c_str());
+		copyString(path, m_path.c_str());
 		if (!Path::replaceExtension(path, "lua")) return;
 
-		OutputMemoryStream blob(app_.getAllocator());
-		for (Variable& var : graph_->m_variables) {
+		OutputMemoryStream blob(m_app.getAllocator());
+		for (Variable& var : m_graph->m_variables) {
 			blob << "local " << var.name.c_str() << " = 0\n";
 		}
 		
-		for (UniquePtr<Node>& node : graph_->m_nodes) {
-			if (node->getType() == Node::Type::MOUSE_MOVE) {
-				node->generate(blob, *graph_.get(), 0);
+		for (Node* node : m_graph->m_nodes) {
+			switch (node->getType()) {
+				case Node::Type::START:
+				case Node::Type::UPDATE:
+				case Node::Type::MOUSE_MOVE:
+					node->generate(blob, *m_graph.get(), 0);
+					break;
+				default: break;
 			}
 		}
 		
 		os::OutputFile file;
-		if (file.open(path)) {
-			bool res = file.write(blob.data(), blob.size());
-			if (!res) {
-				logError("Could not write ", path);
-			}
-			file.close();
+		FileSystem& fs = m_app.getEngine().getFileSystem();
+		if (!fs.saveContentSync(Path(path), blob)) {
+			logError("Could not save ", path);
 		}
 	}
 
-	void save(const char* path) {
-		if (!path[0]) {
-			saveAs();
+	void save() {
+		if (m_path.isEmpty()) m_show_save_as = true;
+		else saveAs(m_path.c_str());
+	}
+
+	void saveAs(const char* path) {
+		ASSERT(path[0]);
+		OutputMemoryStream blob(m_app.getAllocator());
+		m_graph->serialize(blob);
+		FileSystem& fs = m_app.getEngine().getFileSystem();
+		if (!fs.saveContentSync(Path(path), blob)) {
+			logError("Failed to save ", path);
+		}
+	}
+
+	void load(const char* path) {
+		FileSystem& fs = m_app.getEngine().getFileSystem();
+		OutputMemoryStream blob(m_app.getAllocator());
+		if (!fs.getContentSync(Path(path), blob)) {
+			logError("Failed to read ", path);
 			return;
 		}
-		OutputMemoryStream blob(app_.getAllocator());
-		graph_->serialize(blob);
 
-		os::OutputFile file;
-		if (file.open(path)) {
-			if (!file.write(blob.data(), blob.size())) {
-				logError("Failed to write ", path);
-			}
-			else {
-				path_ = path;
-				//m_dirty = false;
-			}
-			file.close();
+		m_graph.destroy();
+		m_graph.create(m_app.getAllocator());
+		if (m_graph->deserialize(InputMemoryStream(blob))) {
+			pushUndo(NO_MERGE_UNDO);
+			m_path = path;
+			return;
 		}
-		else {
-			logError("Failed to open ", path);
-		}
-	}
 
-	void saveAs() {
-		char path[LUMIX_MAX_PATH];
-		if (!os::getSaveFilename(Span(path), "Visual script\0*.lvs\0", "lvs")) return;
-
-		save(path);
-	}
-
-	void load() {
-		char path[LUMIX_MAX_PATH];
-		if (!os::getOpenFilename(Span(path), "Visual script\0*.lvs\0", nullptr)) return;
-		os::InputFile file;
-		if (file.open(path)) {
-			const u64 size = file.size();
-			OutputMemoryStream blob(app_.getAllocator());
-			blob.resize(size);
-			if (!file.read(blob.getMutableData(), blob.size())) {
-				logError("Failed to read ", path);
-				file.close();
-				return;
-			}
-			file.close();
-
-			graph_.destroy();
-			graph_.create(app_.getAllocator());
-			if (graph_->deserialize(InputMemoryStream(blob))) {
-				path_ = path;
-				return;
-			}
-
-			graph_.destroy();
-			graph_.create(app_.getAllocator());
-		}
+		m_graph.destroy();
+		m_graph.create(m_app.getAllocator());
+		pushUndo(NO_MERGE_UNDO);
 	}
 
 	void newGraph() {
-		graph_.destroy();
-		graph_.create(app_.getAllocator());
-		path_ = "";
+		if (m_graph.get()) m_graph.destroy();
+		m_graph.create(m_app.getAllocator());
+		m_path = "";
+		m_graph->addNode<UpdateNode>();
+		pushUndo(NO_MERGE_UNDO);
 	}
 
 	void menu() {
 		if (ImGui::BeginMenuBar()) {
 			if (ImGui::BeginMenu("File")) {
 				if (ImGui::MenuItem("New")) newGraph();
-				if (ImGui::MenuItem("Load")) load();
-				//if (ImGui::MenuItem("Load from entity", nullptr, false, emitter)) loadFromEntity();
-				if (ImGui::MenuItem("Generate")) generate();
-				if (ImGui::MenuItem("Save", nullptr, false, !path_.isEmpty())) save(path_.c_str());
-				if (ImGui::MenuItem("Save as")) saveAs();
-				//ImGui::Separator();
-			
-				//menuItem(m_apply_action, emitter && emitter->getResource());
-				//ImGui::MenuItem("Autoapply", nullptr, &m_autoapply, emitter && emitter->getResource());
-
+				if (ImGui::MenuItem("Open")) m_show_open = true;
+				menuItem(m_generate_action, true);
+				menuItem(m_save_action, true);
+				if (ImGui::MenuItem("Save as")) m_show_save_as = true;
+				ImGui::EndMenu();
+			}
+			if (ImGui::BeginMenu("Edit")) {
+				menuItem(m_undo_action, canUndo());
+				menuItem(m_redo_action, canRedo());
 				ImGui::EndMenu();
 			}
 			if (ImGuiEx::IconButton(ICON_FA_CHECK, "Generate")) generate();
-			if (ImGuiEx::IconButton(ICON_FA_FOLDER_OPEN, "Load")) load();
-			if (ImGuiEx::IconButton(ICON_FA_SAVE, "Save")) save(path_.c_str());
+			if (ImGuiEx::IconButton(ICON_FA_FOLDER_OPEN, "Open")) m_show_open = true;
+			if (ImGuiEx::IconButton(ICON_FA_SAVE, "Save")) save();
 			ImGui::EndMenuBar();
 		}
+
+		FileSelector& fs = m_app.getFileSelector();
+		if (fs.gui("Open", &m_show_open, "lvs", false)) load(fs.getPath());
+		if (fs.gui("Save As", &m_show_save_as, "lvs", true)) saveAs(fs.getPath());
 	}
 
 	void onWindowGUI() override {
-		if (!is_open_) return;
+		m_has_focus = false;
+		if (!m_is_open) return;
 
 		i32 hovered_node = -1;
 		i32 hovered_link = -1;
 		ImGui::SetNextWindowSize(ImVec2(200, 200), ImGuiCond_FirstUseEver);
-		if (ImGui::Begin("Visual script", &is_open_, ImGuiWindowFlags_MenuBar)) {
+		if (ImGui::Begin("Visual script", &m_is_open, ImGuiWindowFlags_MenuBar)) {
+			m_has_focus = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
 			menu();
 			ImGui::Columns(2);
 			static bool once = [](){ ImGui::SetColumnWidth(-1, 150); return true; }();
-			for (Variable& var : graph_->m_variables) {
+			for (Variable& var : m_graph->m_variables) {
 				ImGui::PushID(&var);
 				if (ImGuiEx::IconButton(ICON_FA_TRASH, "Delete")) {
-					graph_->m_variables.erase(u32(&var - graph_->m_variables.begin()));
+					m_graph->m_variables.erase(u32(&var - m_graph->m_variables.begin()));
 					ImGui::PopID();
 					break;
 				}
@@ -793,84 +960,77 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 				ImGui::PopID();
 			}
 			if (ImGui::Button(ICON_FA_PLUS " Add variable")) {
-				graph_->m_variables.emplace(app_.getAllocator());
+				m_graph->m_variables.emplace(m_app.getAllocator());
 			}
 			
 			ImGui::NextColumn();
 			static ImVec2 offset = ImVec2(0, 0);
 			const ImVec2 editor_pos = ImGui::GetCursorScreenPos();
-			ImGuiEx::BeginNodeEditor("vs", &offset);
+			nodeEditorGUI(m_graph->m_nodes, m_graph->m_links);
+			/*ImGuiEx::BeginNodeEditor("vs", &offset);
 			
-			for (UniquePtr<Node>& node : graph_->m_nodes) {
+			for (UniquePtr<Node>& node : m_graph->m_nodes) {
 				node->nodeGUI();
 				if (ImGui::IsItemHovered()) {
-					hovered_node = i32(&node - graph_->m_nodes.begin());
+					hovered_node = i32(&node - m_graph->m_nodes.begin());
 				}
 			}
 
-			for (const NodeEditorLink& link : graph_->m_links) {
+			for (const NodeEditorLink& link : m_graph->m_links) {
 				ImGuiEx::NodeLink(link.from, link.to);
 				if (ImGuiEx::IsLinkHovered()) {
-					hovered_link = i32(&link - graph_->m_links.begin());
+					hovered_link = i32(&link - m_graph->m_links.begin());
 				}
 			}
 
 			ImGuiID link_from, link_to;
 			if (ImGuiEx::GetNewLink(&link_from, &link_to)) {
-				NodeEditorLink& link = graph_->m_links.emplace();
+				NodeEditorLink& link = m_graph->m_links.emplace();
 				link.from = link_from;
 				link.to = link_to;
 			}
 
-			ImGuiEx::EndNodeEditor();
+			ImGuiEx::EndNodeEditor();*/
 			ImGui::Columns();
-	
-			if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(1)) {
-				ImGui::OpenPopup("context_menu");
-				context_node_ = hovered_node;
-				context_link_ = hovered_link;
-			}
-
-			contextMenu(editor_pos);
 		}
 		ImGui::End();
 	}
 
-	void contextMenu(const ImVec2& editor_pos) {
-		if (!ImGui::BeginPopup("context_menu")) return;
-
+	void onContextMenu(bool recently_opened, ImVec2 pos) override {
 		ImVec2 cp = ImGui::GetItemRectMin();
 		if (ImGui::BeginMenu("Add node")) {
 			Node* n = nullptr;
-			if (ImGui::Selectable("Add")) n = graph_->addNode<AddNode>();
-			if (ImGui::Selectable("Multiply")) n = graph_->addNode<MulNode>();
+			if (ImGui::Selectable("Add")) n = m_graph->addNode<AddNode>();
+			if (ImGui::Selectable("Multiply")) n = m_graph->addNode<MulNode>();
 			if (ImGui::BeginMenu("Set variable")) {
-				for (const Variable& var : graph_->m_variables) {
+				for (const Variable& var : m_graph->m_variables) {
 					if (var.name.length() > 0 && ImGui::Selectable(var.name.c_str())) {
-						n = graph_->addNode<SetVariableNode>(*graph_, u32(&var - graph_->m_variables.begin()));
+						n = m_graph->addNode<SetVariableNode>(*m_graph, u32(&var - m_graph->m_variables.begin()));
 					}
 				}
 				ImGui::EndMenu();
 			}
 			if (ImGui::BeginMenu("Get variable")) {
-				for (const Variable& var : graph_->m_variables) {
+				for (const Variable& var : m_graph->m_variables) {
 					if (var.name.length() > 0 && ImGui::Selectable(var.name.c_str())) {
-						n = graph_->addNode<GetVariableNode>(*graph_, u32(&var - graph_->m_variables.begin()));
+						n = m_graph->addNode<GetVariableNode>(*m_graph, u32(&var - m_graph->m_variables.begin()));
 					}
 				}
 				ImGui::EndMenu();
 			}
-			if (ImGui::Selectable("Self")) n = graph_->addNode<SelfNode>();
-			if (ImGui::Selectable("Set yaw")) n = graph_->addNode<SetYawNode>();
-			if (ImGui::Selectable("Mouse move")) n = graph_->addNode<MouseMoveNode>();
-			if (ImGui::Selectable("Constant")) n = graph_->addNode<ConstNode>();
-			if (ImGui::Selectable("Set property")) n = graph_->addNode<SetPropertyNode>();
-			if (ImGui::Selectable("Update")) n = graph_->addNode<UpdateNode>();
-			if (ImGui::Selectable("Vector 3")) n = graph_->addNode<Vec3Node>();
-			if (ImGui::Selectable("Yaw to direction")) n = graph_->addNode<YawToDirNode>();
-			if (ImGui::Selectable("Sequence")) n = graph_->addNode<SequenceNode>();
+			if (ImGui::Selectable("Self")) n = m_graph->addNode<SelfNode>();
+			if (ImGui::Selectable("Set yaw")) n = m_graph->addNode<SetYawNode>();
+			if (ImGui::Selectable("Mouse move")) n = m_graph->addNode<MouseMoveNode>();
+			if (ImGui::Selectable("Constant")) n = m_graph->addNode<ConstNode>();
+			if (ImGui::Selectable("Set property")) n = m_graph->addNode<SetPropertyNode>();
+			if (ImGui::Selectable("Update")) n = m_graph->addNode<UpdateNode>();
+			if (ImGui::Selectable("Vector 3")) n = m_graph->addNode<Vec3Node>();
+			if (ImGui::Selectable("Yaw to direction")) n = m_graph->addNode<YawToDirNode>();
+			if (ImGui::Selectable("Sequence")) n = m_graph->addNode<SequenceNode>(*m_graph);
+			if (ImGui::Selectable("Start")) n = m_graph->addNode<StartNode>();
 			if (n) {
-				n->m_pos = ImGui::GetMousePos() - editor_pos;
+				n->m_pos = pos;
+				pushUndo(NO_MERGE_UNDO);
 			}
 			ImGui::EndMenu();
 		}
@@ -880,7 +1040,8 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 				if (!rcmp.cmp->functions.empty() && ImGui::BeginMenu(rcmp.cmp->name)) {
 					for (reflection::FunctionBase* f : rcmp.cmp->functions) {
 						if (ImGui::Selectable(f->name)) {
-							graph_->addNode<CallNode>(rcmp.cmp, f);
+							m_graph->addNode<CallNode>(rcmp.cmp, f);
+							pushUndo(NO_MERGE_UNDO);
 						}
 					}
 					ImGui::EndMenu();
@@ -888,36 +1049,35 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin {
 			}
 			ImGui::EndMenu();
 		}
-
-		if (context_node_ != -1 && ImGui::Selectable("Remove node")) {
-			graph_->removeNode(context_node_);
-		}
-		if (context_link_ != -1 && ImGui::Selectable("Remove link")) {
-			graph_->removeLink(context_link_);
-		}
-		ImGui::EndPopup();
 	}
 
 	const char* getName() const override { return "visualscript"; }
 
-	StudioApp& app_;
-	Local<Graph> graph_;
-	bool is_open_ = false;
-	Path path_;
-	Action toggle_ui_;
-	i32 context_node_ = -1;
-	i32 context_link_ = -1;
+	StudioApp& m_app;
+	Local<Graph> m_graph;
+	bool m_is_open = false;
+	Path m_path;
+	Action m_toggle_ui;
+	Action m_save_action;
+	Action m_generate_action;
+	Action m_undo_action;
+	Action m_redo_action;
+	Action m_delete_action;
+	bool m_show_save_as = false;
+	bool m_show_open = false;
+	bool m_has_focus = false;
 };
 
 Node* Graph::createNode(Node::Type type) {
 	switch (type) {
 		case Node::Type::ADD: return addNode<AddNode>();
 		case Node::Type::MUL: return addNode<MulNode>();
-		case Node::Type::SEQUENCE: return addNode<SequenceNode>();
+		case Node::Type::SEQUENCE: return addNode<SequenceNode>(*this);
 		case Node::Type::SELF: return addNode<SelfNode>();
 		case Node::Type::SET_YAW: return addNode<SetYawNode>();
 		case Node::Type::CONST: return addNode<ConstNode>();
 		case Node::Type::MOUSE_MOVE: return addNode<MouseMoveNode>();
+		case Node::Type::START: return addNode<StartNode>();
 		case Node::Type::UPDATE: return addNode<UpdateNode>();
 		case Node::Type::VEC3: return addNode<Vec3Node>();
 		case Node::Type::CALL: return addNode<CallNode>();
@@ -925,8 +1085,6 @@ Node* Graph::createNode(Node::Type type) {
 		case Node::Type::SET_VARIABLE: return addNode<SetVariableNode>(*this);
 		case Node::Type::SET_PROPERTY: return addNode<SetPropertyNode>();
 		case Node::Type::YAW_TO_DIR: return addNode<YawToDirNode>();
-
-		default: ASSERT(false); break;
 	}
 	return nullptr;
 }
