@@ -1030,7 +1030,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 		ImGui::End();
 	}
 
-	void onContextMenu(bool recently_opened, ImVec2 pos) override {
+	void onContextMenu(ImVec2 pos) override {
 		ImVec2 cp = ImGui::GetItemRectMin();
 		if (ImGui::BeginMenu("Add node")) {
 			Node* n = nullptr;
