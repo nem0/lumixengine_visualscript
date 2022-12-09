@@ -4,6 +4,8 @@ project "visualscript"
 		"src/**.c",
 		"src/**.cpp",
 		"src/**.h",
+		"external/**.c",
+		"external/**.h",
 		"genie.lua"
 	}
 	defines { "BUILDING_VISUALSCRIPT" }
