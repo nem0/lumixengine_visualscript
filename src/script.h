@@ -14,9 +14,8 @@ enum class ScriptValueType : u32 {
 enum class EnvironmentIndices {
 	SELF = 0,
 	UNIVERSE = 1,
-	TIME_DELTA = 3, // TODO do not pass this through environment
-	
-	VARIABLES = 4
+
+	VARIABLES = 3
 };
 
 enum class ScriptSyscalls : u32 {
@@ -50,6 +49,7 @@ struct ScriptResource : Resource {
 	OutputMemoryStream m_bytecode;
 	u32 m_update_label;
 	u32 m_start_label;
+	u32 m_mouse_move_label;
 	Array<Variable> m_variables;
 };
 

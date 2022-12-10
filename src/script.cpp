@@ -1,5 +1,6 @@
 #include "engine/hash_map.h"
 #include "engine/engine.h"
+#include "engine/input_system.h"
 #include "engine/plugin.h"
 #include "engine/reflection.h"
 #include "engine/resource.h"
@@ -39,6 +40,7 @@ bool ScriptResource::load(u64 size, const u8* mem) {
 
 	blob.read(m_update_label);
 	blob.read(m_start_label);
+	blob.read(m_mouse_move_label);
 	u32 var_count;
 	blob.read(var_count);
 	m_variables.reserve(var_count);
@@ -76,6 +78,7 @@ struct ScriptSceneImpl : ScriptScene {
 		, m_engine(engine)
 		, m_allocator(allocator)
 		, m_scripts(allocator)
+		, m_mouse_move_scripts(allocator)
 	{}
 
 	void serialize(OutputMemoryStream& blob) override {
@@ -109,52 +112,80 @@ struct ScriptSceneImpl : ScriptScene {
 
 	void stopGame() override {
 		m_is_game_running = false;
+		m_mouse_move_scripts.clear();
 	}
 
 	void startGame() override {
 		m_is_game_running = true;
 	}
 
+	static void syscall(KVM* vm, kvm_u32 args_count){
+		if (args_count == 0) return;
+
+		ScriptSyscalls id = (ScriptSyscalls)kvm_get(vm, -(int)args_count);
+		switch (id) {
+			case ScriptSyscalls::SET_YAW: {
+				Universe* univ = (Universe*)kvm_get_ptr(vm, (kvm_i32)EnvironmentIndices::UNIVERSE);
+				EntityRef e = {(i32)kvm_get(vm, -(i32)args_count + 1)};
+				float angle = kvm_get_float(vm, -(i32)args_count + 2);
+				Quat rot(Vec3(0, 1, 0), angle);
+				univ->setRotation(e, rot);
+				break;
+			}
+			case ScriptSyscalls::SET_PROPERTY: {
+				ASSERT(args_count == 6);
+					
+				kvm_u64 prop_hash = kvm_get64(vm, -(i32)args_count + 1);
+				auto* prop = (reflection::Property<float>*)reflection::getPropertyFromHash(StableHash::fromU64(prop_hash));
+					
+				Universe* univ = (Universe*)kvm_get_ptr(vm, (kvm_i32)EnvironmentIndices::UNIVERSE);
+				ComponentType cmp_type = {(i32)kvm_get(vm, -(i32)args_count + 3)};
+				IScene* scene = univ->getScene(cmp_type);
+					
+				int entity_index = kvm_get(vm, -(i32)args_count + 4);
+				float v = kvm_get_float(vm, -(i32)args_count + 5);
+					
+				prop->setter(scene, {entity_index}, 0, v);
+				break;
+			}
+		}
+	}
+
+	void onMouseEvent(const InputSystem::Event& event) {
+		for (EntityRef e : m_mouse_move_scripts) {
+			Script& script = m_scripts[e];
+			KVM vm;
+			kvm_init(&vm, (u32*)script.m_environment.getMutableData(), (u32)script.m_environment.size());
+			kvm_push_float(&vm, event.data.axis.x);
+			kvm_push_float(&vm, event.data.axis.y);
+			const OutputMemoryStream& bytecode = script.m_resource->m_bytecode;
+			kvm_call(&vm, bytecode.data(), syscall, script.m_resource->m_mouse_move_label);
+		}
+	}
+
 	void update(float time_delta, bool paused) override {
 		if (paused) return;
 		if (!m_is_game_running) return;
 		
+		InputSystem& input = m_engine.getInputSystem();
+		const InputSystem::Event* events = input.getEvents();
+		for (u32 i = 0, c = input.getEventsCount(); i < c; ++i) {
+			switch(events[i].type) {
+				case InputSystem::Event::AXIS:
+					if (events[i].device->type == InputSystem::Device::MOUSE) {
+						onMouseEvent(events[i]);
+					}
+					break;
+				default: break;
+			}
+		}
+
 		for (auto iter = m_scripts.begin(), end = m_scripts.end(); iter != end; ++iter) {
 			Script& script = iter.value();
 			if (!script.m_resource) continue;
 			if (!script.m_resource->isReady()) continue;
 
-			auto syscall = [](KVM* vm, kvm_u32 args_count){
-				if (args_count == 0) return;
-
-				ScriptSyscalls id = (ScriptSyscalls)kvm_get(vm, -(int)args_count);
-				switch (id) {
-					case ScriptSyscalls::SET_YAW: {
-						Universe* univ = (Universe*)kvm_get_ptr(vm, (kvm_i32)EnvironmentIndices::UNIVERSE);
-						EntityRef e = {(i32)kvm_get(vm, -(i32)args_count + 1)};
-						float angle = kvm_get_float(vm, -(i32)args_count + 2);
-						Quat rot(Vec3(0, 1, 0), angle);
-						univ->setRotation(e, rot);
-						break;
-					}
-					case ScriptSyscalls::SET_PROPERTY: {
-						ASSERT(args_count == 6);
-					
-						kvm_u64 prop_hash = kvm_get64(vm, -(i32)args_count + 1);
-						auto* prop = (reflection::Property<float>*)reflection::getPropertyFromHash(StableHash::fromU64(prop_hash));
-					
-						Universe* univ = (Universe*)kvm_get_ptr(vm, (kvm_i32)EnvironmentIndices::UNIVERSE);
-						ComponentType cmp_type = {(i32)kvm_get(vm, -(i32)args_count + 3)};
-						IScene* scene = univ->getScene(cmp_type);
-					
-						int entity_index = kvm_get(vm, -(i32)args_count + 4);
-						float v = kvm_get_float(vm, -(i32)args_count + 5);
-					
-						prop->setter(scene, {entity_index}, 0, v);
-						break;
-					}
-				}
-			};
+	
 
 			const OutputMemoryStream& bytecode = script.m_resource->m_bytecode;
 			bool start = false;
@@ -173,18 +204,25 @@ struct ScriptSceneImpl : ScriptScene {
 					}
 				}
 				start = true;
+				if (script.m_resource->m_start_label != KVM_INVALID_LABEL) {
+					m_mouse_move_scripts.push(iter.key());
+				}
 			}
 			KVM vm;
-			memcpy(script.m_environment.getMutableData() + 12, &time_delta, sizeof(time_delta));
 			kvm_init(&vm, (u32*)script.m_environment.getMutableData(), (u32)script.m_environment.size());
-			if (start) {
+			if (start && script.m_resource->m_start_label != KVM_INVALID_LABEL) {
 				kvm_call(&vm, bytecode.data(), syscall, script.m_resource->m_start_label);
 			}
-			kvm_call(&vm, bytecode.data(), syscall, script.m_resource->m_update_label);
+			if (script.m_resource->m_update_label != KVM_INVALID_LABEL) {
+				ASSERT(vm.sp == 0);
+				kvm_push_float(&vm, time_delta);
+				kvm_call(&vm, bytecode.data(), syscall, script.m_resource->m_update_label);
+			}
 		}
 	}
 
 	void destroyScript(EntityRef entity) {
+		m_mouse_move_scripts.eraseItem(entity);
 		m_scripts.erase(entity);
 		m_universe.onComponentDestroyed(entity, SCRIPT_TYPE, this);
 	}
@@ -220,6 +258,7 @@ struct ScriptSceneImpl : ScriptScene {
 	IPlugin& m_plugin;
 	Universe& m_universe;
 	HashMap<EntityRef, Script> m_scripts;
+	Array<EntityRef> m_mouse_move_scripts;
 	bool m_is_game_running = false;
 };
 

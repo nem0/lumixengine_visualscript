@@ -167,10 +167,12 @@ struct Graph {
 		kvm_bc_start_write(&writer, bytecode, sizeof(bytecode));
 		kvm_label update_label = kvm_bc_create_label(&writer);
 		kvm_label start_label = kvm_bc_create_label(&writer);
+		kvm_label mouse_move_label = kvm_bc_create_label(&writer);
 		for (Node* node : m_nodes) {
 			switch (node->getType()) {
 				case Node::Type::MOUSE_MOVE:
-					ASSERT(false); // TODO
+					kvm_bc_place_label(&writer, mouse_move_label);
+					node->generate(writer, *this, 0);
 					break;
 				case Node::Type::START:
 					kvm_bc_place_label(&writer, start_label);
@@ -188,6 +190,7 @@ struct Graph {
 		
 		blob.write(writer.labels[update_label]);
 		blob.write(writer.labels[start_label]);
+		blob.write(writer.labels[mouse_move_label]);
 		blob.write(m_variables.size());
 		for (const Variable& v : m_variables) {
 			blob.writeString(v.name.c_str());
@@ -597,6 +600,9 @@ struct MouseMoveNode : Node {
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
 
+	ScriptValueType getOutputType(u32 idx, const Graph& graph) { return ScriptValueType::FLOAT; }
+
+
 	bool onGUI() override {
 		nodeTitle(ICON_FA_MOUSE " Mouse move", false, true);
 		outputPin(); ImGui::TextUnformatted("Delta X");
@@ -606,19 +612,18 @@ struct MouseMoveNode : Node {
 	
 	
 	void generate(kvm_bc_writer& writer, const Graph& graph, u32 output_idx) override {
-		ASSERT(false);
-		#if 0
-		if (output_idx == 0) {
-			blob << "function onInputEvent(event)\n";
-			blob << "\tif event.type == LumixAPI.INPUT_EVENT_AXIS and event.device.type == LumixAPI.INPUT_DEVICE_MOUSE then\n";
-			Node::NodeInput n = getOutputNode(0, graph);
-			if (n.node) {
-				n.node->generate(blob, graph, n.input_idx);
+		switch (output_idx) {
+			case 0: {
+				NodeInput o = getOutputNode(0, graph);
+				if(o.node) o.node->generate(writer, graph, o.input_idx);
+				kvm_bc_end(&writer);
+				break;
 			}
-			blob << "\tend\n";
-			blob << "end\n";
+			case 1:
+			case 2:
+				kvm_bc_get_local(&writer, output_idx - 1);	
+				break;
 		}
-		#endif
 	}
 };
 
@@ -705,7 +710,7 @@ struct UpdateNode : Node {
 			kvm_bc_end(&writer);
 		}
 		else {
-			kvm_bc_get(&writer, (kvm_u32)EnvironmentIndices::TIME_DELTA);	
+			kvm_bc_get_local(&writer, 0);	
 		}
 	}
 };

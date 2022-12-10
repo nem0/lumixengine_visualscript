@@ -59,6 +59,9 @@ typedef enum KVM_OP {
 	// push return address and jump
 	KVM_OP_CALL,
 	
+	// push(stack[idx])
+	KVM_OP_GET_LOCAL,
+	
 	// push(env[idx])
 	KVM_OP_GET,
 	
@@ -199,6 +202,13 @@ void kvm_call(KVM* vm, const kvm_u8* bytecode, kvm_syscall syscall, kvm_label la
 				++sp;
 				break;
 			}
+			case KVM_OP_GET_LOCAL: {
+				kvm_i32 idx;
+				READ(idx);
+				memcpy(vm->stack + sp, vm->stack + idx, sizeof(kvm_u32));
+				++sp;
+				break;
+			}
 			case KVM_OP_JMP: {
 				kvm_label label;
 				READ(label);
@@ -215,7 +225,7 @@ void kvm_call(KVM* vm, const kvm_u8* bytecode, kvm_syscall syscall, kvm_label la
 				break;
 			case KVM_OP_ADD:
 				--sp;
-				vm->stack[sp - 1] *= vm->stack[sp];
+				vm->stack[sp - 1] += vm->stack[sp];
 				break;
 			case KVM_OP_ADDF:
 				--sp;
@@ -298,6 +308,7 @@ void kvm_bc_end_write(kvm_bc_writer* writer) {
 				ip += sizeof(kvm_u64);
 				break;
 			case KVM_OP_SYSCALL:
+			case KVM_OP_GET_LOCAL:
 			case KVM_OP_GET:
 			case KVM_OP_SET:
 			case KVM_OP_CONST32:
@@ -353,6 +364,7 @@ void kvm_bc_start_write(kvm_bc_writer* writer, kvm_u8* bytecode, kvm_u32 capacit
 	DEFINE_SIMPLE_OP_WRITER_U32(jmp, JMP);
 	DEFINE_SIMPLE_OP_WRITER_U32(call, CALL);
 	DEFINE_SIMPLE_OP_WRITER_U32(get, GET);
+	DEFINE_SIMPLE_OP_WRITER_U32(get_local, GET_LOCAL);
 	DEFINE_SIMPLE_OP_WRITER_U32(set, SET);
 	DEFINE_SIMPLE_OP_WRITER_U32(syscall, SYSCALL);
 	DEFINE_SIMPLE_OP_WRITER_U32(const, CONST32);
@@ -380,7 +392,7 @@ void kvm_bc_const64(kvm_bc_writer* writer, kvm_u64 value) {
 
 
 kvm_label kvm_bc_create_label(kvm_bc_writer* writer) {
-	writer->labels[writer->labels_count] = 0xFFffFFff;
+	writer->labels[writer->labels_count] = KVM_INVALID_LABEL;
 	++writer->labels_count;
 	return writer->labels_count - 1;
 }

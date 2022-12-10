@@ -4,7 +4,10 @@
 extern "C" {
 #endif
 
-enum { KVM_STACK_SIZE = 1024 };
+enum {
+	KVM_STACK_SIZE = 1024,
+	KVM_INVALID_LABEL = 0xFFffFFff
+};
 
 typedef unsigned char kvm_u8;
 typedef unsigned kvm_u32;
@@ -58,6 +61,8 @@ void kvm_bc_end_write(kvm_bc_writer* writer);
 void kvm_bc_pop(kvm_bc_writer* writer);
 // push environment[env_idx] to stack
 void kvm_bc_get(kvm_bc_writer* writer, kvm_u32 env_idx);
+// push stack[idx] to top of stack
+void kvm_bc_get_local(kvm_bc_writer* writer, kvm_u32 stack_idx);
 // pop from stack and set is as environment[env_idx]
 void kvm_bc_set(kvm_bc_writer* writer, kvm_u32 env_idx);
 // pop 2 values from stack, add them and push the result
