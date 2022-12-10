@@ -176,7 +176,7 @@ struct ScriptSceneImpl : ScriptScene {
 			}
 			KVM vm;
 			memcpy(script.m_environment.getMutableData() + 12, &time_delta, sizeof(time_delta));
-			kvm_init(&vm, script.m_environment.getMutableData(), (u32)script.m_environment.size());
+			kvm_init(&vm, (u32*)script.m_environment.getMutableData(), (u32)script.m_environment.size());
 			if (start) {
 				kvm_call(&vm, bytecode.data(), syscall, script.m_resource->m_start_label);
 			}

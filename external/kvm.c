@@ -6,12 +6,6 @@
 	#pragma warning(error : 4062)
 #endif
 
-typedef union kvm_reg32 {
-	kvm_u32 u;
-	kvm_i32 i;
-	float f;
-} kvm_reg32;
-
 typedef enum KVM_OP {
 	// end execution
 	KVM_OP_END,
@@ -19,34 +13,44 @@ typedef enum KVM_OP {
 	// call syscall with fixed number of args, pop the args after
 	KVM_OP_SYSCALL,
 
-	// push 32bit constant to stack, and store it in eax
+	// push 32bit constant to stack
 	KVM_OP_CONST32,
 
-	// push 64bit constant to stack, and store it in eax
+	// push 64bit constant to stack
 	KVM_OP_CONST64,
 
-	// push eax to stack
-	KVM_OP_PUSH,
-
-	// pop from stack to eax
+	// pop from
 	KVM_OP_POP,
 
-	// jump if eax == ebx
+	// skip next instruction (must be jmp) if stack[-1] == stack[-2]
 	KVM_OP_EQ,
 
-	// eax += ebx
+	// skip next instruction (must be jmp) if stack[-1] != stack[-2]
+	KVM_OP_NEQ,
+
+	// skip next instruction (must be jmp) if stack[-2] < stack[-1]
+	KVM_OP_LT,
+	// float version
+	KVM_OP_LTF,
+
+	// skip next instruction (must be jmp) if stack[-2] > stack[-1]
+	KVM_OP_GT,
+	// float version
+	KVM_OP_GTF,
+
+	// see kvm_bc_add
 	KVM_OP_ADD,
 	
-	// eax += ebx (as floats)
+	// see kvm_bc_addf
 	KVM_OP_ADDF,
 	
-	// eax *= ebx
+	// see kvm_bc_mul
 	KVM_OP_MUL,
 	
-	// eax *= ebx
+	// see kvm_bc_mulf
 	KVM_OP_MULF,
 	
-	// jump to eax
+	// jump to label
 	KVM_OP_JMP,
 	
 	// pop return address and jump to it
@@ -55,20 +59,20 @@ typedef enum KVM_OP {
 	// push return address and jump
 	KVM_OP_CALL,
 	
-	// eax = env[idx], push(eax)
+	// push(env[idx])
 	KVM_OP_GET,
 	
-	// env[idx] = eax
+	// env[idx] = stack[-1]
 	KVM_OP_SET,
 } KVM_OP;
 
 kvm_u32 kvm_get(KVM* vm, kvm_i32 idx) {
 	kvm_u32 res;
 	if (idx >= 0) {
-		memcpy(&res, vm->environment + idx * sizeof(kvm_u32), sizeof(res));
+		memcpy(&res, vm->environment + idx, sizeof(res));
 	}
 	else {
-		memcpy(&res, vm->stack + vm->sp + idx * sizeof(kvm_u32), sizeof(res));
+		memcpy(&res, vm->stack + vm->sp + idx, sizeof(res));
 	}
 	return res;
 }
@@ -76,10 +80,10 @@ kvm_u32 kvm_get(KVM* vm, kvm_i32 idx) {
 void* kvm_get_ptr(KVM* vm, kvm_i32 idx) {
 	void *res;
 	if (idx >= 0) {
-		memcpy(&res, vm->environment + idx * sizeof(kvm_u32), sizeof(res));
+		memcpy(&res, vm->environment + idx, sizeof(res));
 	}
 	else {
-		memcpy(&res, vm->stack + vm->sp + idx * sizeof(kvm_u32), sizeof(res));
+		memcpy(&res, vm->stack + vm->sp + idx, sizeof(res));
 	}
 	return res;
 
@@ -88,40 +92,40 @@ void* kvm_get_ptr(KVM* vm, kvm_i32 idx) {
 kvm_u64 kvm_get64(KVM* vm, kvm_i32 idx) {
 	kvm_u64 res;
 	if (idx >= 0) {
-		memcpy(&res, vm->environment + idx * sizeof(kvm_u32), sizeof(res));
+		memcpy(&res, vm->environment + idx, sizeof(res));
 	}
 	else {
-		memcpy(&res, vm->stack + vm->sp + idx * sizeof(kvm_u32), sizeof(res));
+		memcpy(&res, vm->stack + vm->sp + idx, sizeof(res));
 	}
 	return res;
 }
 
 float kvm_get_float(KVM* vm, kvm_i32 idx) {
 	float res;
-	memcpy(&res, vm->stack + vm->sp + idx * sizeof(kvm_u32), sizeof(res));
+	memcpy(&res, vm->stack + vm->sp + idx, sizeof(res));
 	return res;
 }
 
 
 void kvm_push(KVM* vm, kvm_u32 value) {
 	memcpy(vm->stack + vm->sp, &value, sizeof(value));
-	vm->sp += sizeof(value);
+	++vm->sp;
 }
 
 void kvm_push_float(KVM* vm, float value) {
 	memcpy(vm->stack + vm->sp, &value, sizeof(value));
-	vm->sp += sizeof(value);
+	++vm->sp;
 }
 
 void kvm_push_ptr(KVM* vm, void* value) {
 	memcpy(vm->stack + vm->sp, &value, sizeof(value));
-	vm->sp += sizeof(value);
+	vm->sp += sizeof(value) / sizeof(kvm_u32);
 }
 
-void kvm_init(KVM* vm, kvm_u8* environment, kvm_u32 environment_size) {
+void kvm_init(KVM* vm, kvm_u32* environment, kvm_u32 environment_size_bytes) {
 	vm->sp = 0;
 	vm->environment = environment;
-	vm->environment_size = environment_size;
+	vm->environment_size_bytes = environment_size_bytes;
 }
 
 void kvm_call(KVM* vm, const kvm_u8* bytecode, kvm_syscall syscall, kvm_label label) {
@@ -133,9 +137,6 @@ void kvm_call(KVM* vm, const kvm_u8* bytecode, kvm_syscall syscall, kvm_label la
 		} while(false)
 
 	const kvm_u8* ip = bytecode + label; 
-	kvm_reg32 eax;
-	kvm_reg32 ebx;
-	eax.u = ebx.u = 0xCCccCCcc;
 	kvm_u32 sp = vm->sp;
 	bool finished = false;
 	while (!finished) {
@@ -153,30 +154,25 @@ void kvm_call(KVM* vm, const kvm_u8* bytecode, kvm_syscall syscall, kvm_label la
 				break;
 			}
 			case KVM_OP_CONST32: 
-				ebx = eax; 
-				READ(eax);
-				memcpy(vm->stack + sp, &eax, sizeof(eax));
-				sp += sizeof(eax);
+				memcpy(vm->stack + sp, ip, sizeof(kvm_u32));
+				ip += sizeof(kvm_u32);
+				++sp;
 				break;
 			case KVM_OP_CONST64: {
-				kvm_u64 v;
-				READ(v);
-				memcpy(vm->stack + sp, &v, sizeof(v));
-				sp += sizeof(v);
+				memcpy(vm->stack + sp, ip, sizeof(kvm_u64));
+				ip += sizeof(kvm_u64);
+				sp += 2;
 				break;
 			}
 			case KVM_OP_RET: {
 				kvm_u32 addr;
-				sp -= sizeof(addr);
-				// pop return address
+				--sp;
 				memcpy(&addr, vm->stack + sp, sizeof(addr));
 				ip = bytecode + addr;
 				break;
 			}
 			case KVM_OP_POP:
-				ebx = eax;
-				sp -= sizeof(eax);
-				memcpy(&eax, vm->stack + sp, sizeof(eax));
+				--sp;
 				break;
 			case KVM_OP_CALL: {
 				kvm_u32 func_addr;
@@ -184,50 +180,81 @@ void kvm_call(KVM* vm, const kvm_u8* bytecode, kvm_syscall syscall, kvm_label la
 
 				kvm_u32 ret_addr = (kvm_u32)(ip - bytecode);
 				memcpy(vm->stack + sp, &ret_addr, sizeof(ret_addr));
-				sp += sizeof(ret_addr);
+				++sp;
 				ip = bytecode + func_addr;
 				break;
 			}
 			case KVM_OP_SET: {
 				kvm_i32 idx;
 				READ(idx);
-				memcpy(vm->environment + idx * sizeof(kvm_u32), &eax, sizeof(eax));
+				--sp;
+				kvm_u32 v = vm->stack[sp];
+				memcpy(vm->environment + idx, &v, sizeof(v));
 				break;
 			}
 			case KVM_OP_GET: {
 				kvm_i32 idx;
 				READ(idx);
-				memcpy(&eax, vm->environment + idx * sizeof(kvm_u32), sizeof(eax));
-				memcpy(vm->stack + sp, &eax, sizeof(eax));
-				sp += sizeof(eax);
+				memcpy(vm->stack + sp, vm->environment + idx, sizeof(kvm_u32));
+				++sp;
 				break;
 			}
-			case KVM_OP_JMP: 
-				ip = bytecode + eax.u;
+			case KVM_OP_JMP: {
+				kvm_label label;
+				READ(label);
+				ip = bytecode + label;
 				break;
+			}
 			case KVM_OP_MUL:
-				eax.u = eax.u * ebx.u;
+				--sp;
+				vm->stack[sp - 1] *= vm->stack[sp];
 				break;
 			case KVM_OP_MULF:
-				eax.f = eax.f * ebx.f;
+				--sp;
+				*(float*)(vm->stack + sp - 1) *= *(float*)(vm->stack + sp);
 				break;
 			case KVM_OP_ADD:
-				eax.u = eax.u + ebx.u;
+				--sp;
+				vm->stack[sp - 1] *= vm->stack[sp];
 				break;
 			case KVM_OP_ADDF:
-				eax.f = eax.f + ebx.f;
+				--sp;
+				*(float*)(vm->stack + sp - 1) += *(float*)(vm->stack + sp);
 				break;
-			case KVM_OP_EQ: {
-				kvm_u32 jump_address;
-				READ(jump_address);
-				if (eax.u == ebx.u) {
-					ip = bytecode + jump_address;
+			case KVM_OP_EQ:
+				sp -= 2;
+				if (vm->stack[sp] == vm->stack[sp + 1]) {
+					ip += sizeof(KVM_OP) + sizeof(kvm_label);
 				}
 				break;
-			}
-			case KVM_OP_PUSH:
-				memcpy(vm->stack + sp, &eax, sizeof(eax));
-				sp += sizeof(eax);
+			case KVM_OP_NEQ:
+				sp -= 2;
+				if (vm->stack[sp] != vm->stack[sp + 1]) {
+					ip += sizeof(KVM_OP) + sizeof(kvm_label);
+				}
+				break;
+			case KVM_OP_GT:
+				sp -= 2;
+				if (vm->stack[sp] > vm->stack[sp + 1]) {
+					ip += sizeof(KVM_OP) + sizeof(kvm_label);
+				}
+				break;
+			case KVM_OP_LT:
+				sp -= 2;
+				if (vm->stack[sp] < vm->stack[sp + 1]) {
+					ip += sizeof(KVM_OP) + sizeof(kvm_label);
+				}
+				break;
+			case KVM_OP_GTF:
+				sp -= 2;
+				if (*(float*)&vm->stack[sp] > *(float*)&vm->stack[sp + 1]) {
+					ip += sizeof(KVM_OP) + sizeof(kvm_label);
+				}
+				break;
+			case KVM_OP_LTF:
+				if (*(float*)&vm->stack[sp] < *(float*)&vm->stack[sp + 1]) {
+					ip += sizeof(KVM_OP) + sizeof(kvm_label);
+				}
 				break;
 		}
 	}
@@ -248,15 +275,19 @@ void kvm_bc_end_write(kvm_bc_writer* writer) {
 		switch(op) {
 			case KVM_OP_RET:
 			case KVM_OP_POP:
-			case KVM_OP_PUSH:
-			case KVM_OP_JMP:
 			case KVM_OP_MUL:
 			case KVM_OP_MULF:
 			case KVM_OP_ADD:
 			case KVM_OP_ADDF:
+			case KVM_OP_EQ:
+			case KVM_OP_NEQ:
+			case KVM_OP_LTF:
+			case KVM_OP_LT:
+			case KVM_OP_GTF:
+			case KVM_OP_GT:
 			case KVM_OP_END:
 				break;
-			case KVM_OP_EQ:
+			case KVM_OP_JMP:
 			case KVM_OP_CALL: {
 				kvm_label label;
 				READ(label);
@@ -306,15 +337,21 @@ void kvm_bc_start_write(kvm_bc_writer* writer, kvm_u8* bytecode, kvm_u32 capacit
 	}
 
 	DEFINE_SIMPLE_OP_WRITER(end, END);
-	DEFINE_SIMPLE_OP_WRITER(push, PUSH);
 	DEFINE_SIMPLE_OP_WRITER(pop, POP);
 	DEFINE_SIMPLE_OP_WRITER(add, ADD);
 	DEFINE_SIMPLE_OP_WRITER(addf, ADDF);
 	DEFINE_SIMPLE_OP_WRITER(mul, MUL);
 	DEFINE_SIMPLE_OP_WRITER(mulf, MULF);
-	DEFINE_SIMPLE_OP_WRITER(jmp, JMP);
 	DEFINE_SIMPLE_OP_WRITER(ret, RET);
+	DEFINE_SIMPLE_OP_WRITER(eq, EQ);
+	DEFINE_SIMPLE_OP_WRITER(neq, NEQ);
+	DEFINE_SIMPLE_OP_WRITER(gt, GT);
+	DEFINE_SIMPLE_OP_WRITER(gtf, GTF);
+	DEFINE_SIMPLE_OP_WRITER(lt, LT);
+	DEFINE_SIMPLE_OP_WRITER(ltf, LTF);
 
+	DEFINE_SIMPLE_OP_WRITER_U32(jmp, JMP);
+	DEFINE_SIMPLE_OP_WRITER_U32(call, CALL);
 	DEFINE_SIMPLE_OP_WRITER_U32(get, GET);
 	DEFINE_SIMPLE_OP_WRITER_U32(set, SET);
 	DEFINE_SIMPLE_OP_WRITER_U32(syscall, SYSCALL);
@@ -341,23 +378,6 @@ void kvm_bc_const64(kvm_bc_writer* writer, kvm_u64 value) {
 	writer->ip += size;
 }
 
-void kvm_bc_eq(kvm_bc_writer* writer, kvm_label label) {
-	kvm_u32 size = sizeof(KVM_OP) + sizeof(kvm_label);
-	if (writer->capacity < size) return;
-	KVM_OP op = KVM_OP_EQ;
-	memcpy(writer->ip, &op, sizeof(op));
-	memcpy(writer->ip + sizeof(op), &label, sizeof(label));
-	writer->ip += size;
-}
-
-void kvm_bc_call(kvm_bc_writer* writer, kvm_label function) {
-	kvm_u32 size = sizeof(KVM_OP) + sizeof(function);
-	if (writer->capacity < size) return;
-	KVM_OP op = KVM_OP_CALL;
-	memcpy(writer->ip, &op, sizeof(op));
-	memcpy(writer->ip + sizeof(op), &function, sizeof(function));
-	writer->ip += size;
-}
 
 kvm_label kvm_bc_create_label(kvm_bc_writer* writer) {
 	writer->labels[writer->labels_count] = 0xFFffFFff;

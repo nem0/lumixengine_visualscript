@@ -49,7 +49,14 @@ struct Node : NodeEditorNode {
 		CALL,
 		VEC3,
 		YAW_TO_DIR,
-		START
+		START,
+		IF,
+		EQ,
+		NEQ,
+		GT,
+		LT,
+		GTE,
+		LTE
 	};
 
 	bool nodeGUI() override {
@@ -293,6 +300,102 @@ Node::NodeOutput Node::getInputNode(u32 idx, const Graph& graph) {
 	return { graph.getNode(from & 0x7fFF), from >> 16 };
 }
 
+template <auto T>
+struct CompareNode : Node {
+	Type getType() const override { return T; }
+	bool hasInputPins() const override { return true; }
+	bool hasOutputPins() const override { return true; }
+
+	ScriptValueType getOutputType(u32 idx, const Graph& graph) override {
+		NodeOutput n0 = getInputNode(0, graph);
+		if (n0) return n0.node->getOutputType(n0.output_idx, graph);
+		return ScriptValueType::U32;
+	}
+
+	bool onGUI() override {
+		switch (T) {
+			case Type::GT: nodeTitle(">", false, false); break;
+			case Type::LT: nodeTitle("<", false, false); break;
+			case Type::GTE: nodeTitle(">=", false, false); break;
+			case Type::LTE: nodeTitle(">=", false, false); break;
+			case Type::EQ: nodeTitle("=", false, false); break;
+			case Type::NEQ: nodeTitle("<>", false, false); break;
+			default: ASSERT(false); break;
+		}
+		outputPin();
+		inputPin(); ImGui::TextUnformatted("A");
+		inputPin(); ImGui::TextUnformatted("B");
+		return false;
+	}
+
+	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
+		NodeOutput a = getInputNode(0, graph);
+		NodeOutput b = getInputNode(1, graph);
+		if (!a) return;
+		if (!b) return;
+
+		a.generate(writer, graph);
+		b.generate(writer, graph);
+
+		if (getOutputType(0, graph) == ScriptValueType::FLOAT) {
+			switch (T) {
+				case Type::EQ: kvm_bc_eq(&writer); return;
+				case Type::NEQ: kvm_bc_neq(&writer); return;
+				case Type::LT: kvm_bc_ltf(&writer); return;
+				case Type::GT: kvm_bc_gtf(&writer); return;
+				default: ASSERT(false); return;
+			}
+		}
+
+		switch (T) {
+			case Type::EQ: kvm_bc_eq(&writer); break;
+			case Type::NEQ: kvm_bc_neq(&writer); break;
+			case Type::LT: kvm_bc_lt(&writer); break;
+			case Type::GT: kvm_bc_gt(&writer); break;
+			default: ASSERT(false); break;
+		}
+	}
+};
+
+struct IfNode : Node {
+	Type getType() const override { return Type::IF; }
+	bool hasInputPins() const override { return true; }
+	bool hasOutputPins() const override { return true; }
+
+	bool onGUI() override {
+		nodeTitle("If", false, false);
+		ImGui::BeginGroup();
+		flowInput(); ImGui::TextUnformatted(" ");
+		inputPin(); ImGui::TextUnformatted("Condition");
+		ImGui::EndGroup();
+		ImGui::SameLine();
+		ImGui::BeginGroup();
+		flowOutput(); ImGui::TextUnformatted("True");
+		flowOutput(); ImGui::TextUnformatted("False");
+		ImGui::EndGroup();
+		return false;
+	}
+
+	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
+		NodeInput true_branch = getOutputNode(0, graph);
+		NodeInput false_branch = getOutputNode(1, graph);
+		NodeOutput cond = getInputNode(1, graph);
+		if (!true_branch.node || !false_branch.node) return;
+		if (!cond) return;
+		
+		kvm_u32 else_label = kvm_bc_create_label(&writer);
+		kvm_u32 endif_label = kvm_bc_create_label(&writer);
+		
+		cond.generate(writer, graph);
+		kvm_bc_jmp(&writer, else_label);
+		true_branch.node->generate(writer, graph, 0);
+		kvm_bc_jmp(&writer, endif_label);
+		kvm_bc_place_label(&writer, else_label);
+		false_branch.node->generate(writer, graph, 0);
+		kvm_bc_place_label(&writer, endif_label);
+	}
+};
+
 struct SequenceNode : Node {
 	SequenceNode(Graph& graph) : m_graph(graph) {}
 	Type getType() const override { return Type::SEQUENCE; }
@@ -317,7 +420,7 @@ struct SequenceNode : Node {
 		for (u32 i = 0; ; ++i) {
 			NodeInput n = getOutputNode(i, graph);
 			if (!n.node) return;
-			n.node->generate(writer, graph, n.input_idx);
+			n.node->generate(writer, graph, 0);
 		}
 	}
 	Graph& m_graph;
@@ -561,13 +664,10 @@ struct MulNode : Node {
 
 		n0.generate(writer, graph);
 		n1.generate(writer, graph);
-		kvm_bc_pop(&writer);
-		kvm_bc_pop(&writer);
 		if (n0.node->getOutputType(n0.output_idx, graph) == ScriptValueType::FLOAT)
 			kvm_bc_mulf(&writer);
 		else
 			kvm_bc_mul(&writer);
-		kvm_bc_push(&writer);
 	}
 
 	bool onGUI() override {
@@ -605,13 +705,10 @@ struct AddNode : Node {
 
 		n0.generate(writer, graph);
 		n1.generate(writer, graph);
-		kvm_bc_pop(&writer);
-		kvm_bc_pop(&writer);
 		if (n0.node->getOutputType(n0.output_idx, graph) == ScriptValueType::FLOAT)
 			kvm_bc_addf(&writer);
 		else
 			kvm_bc_add(&writer);
-		kvm_bc_push(&writer);
 	}
 
 	bool onGUI() override {
@@ -641,7 +738,6 @@ struct SetVariableNode : Node {
 	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
 		NodeOutput n = getInputNode(1, graph);
 		n.generate(writer, graph);
-		kvm_bc_pop(&writer);
 		kvm_bc_set(&writer, ((u32)EnvironmentIndices::VARIABLES) + m_var);
 		generateNext(writer, graph);
 	}
@@ -943,7 +1039,12 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 			{ '3', "Vec3", Node::Type::VEC3 },
 			{ 'A', "Add", Node::Type::ADD },
 			{ 'C', "Call", Node::Type::MUL },
+			{ 'E', "Equal", Node::Type::EQ },
+			{ 'G', "Greater than", Node::Type::GT },
+			{ 'I', "If", Node::Type::IF },
+			{ 'L', "Less than", Node::Type::LT },
 			{ 'M', "Multiply", Node::Type::MUL },
+			{ 'N', "Not equal", Node::Type::NEQ},
 			{ 'T', "Self", Node::Type::SELF },
 			{ 'S', "Sequence", Node::Type::SEQUENCE },
 			{ 'P', "Set property", Node::Type::SET_PROPERTY },
@@ -1174,6 +1275,17 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 				}
 				ImGui::EndMenu();
 			}
+			if (ImGui::BeginMenu("Compare")) {
+				if (ImGui::Selectable("=")) n = m_graph->addNode<CompareNode<Node::Type::EQ>>();
+				if (ImGui::Selectable("<>")) n = m_graph->addNode<CompareNode<Node::Type::NEQ>>();
+				if (ImGui::Selectable("<")) n = m_graph->addNode<CompareNode<Node::Type::LT>>();
+				if (ImGui::Selectable(">")) n = m_graph->addNode<CompareNode<Node::Type::GT>>();
+				if (ImGui::Selectable("<=")) n = m_graph->addNode<CompareNode<Node::Type::GTE>>();
+				if (ImGui::Selectable(">=")) n = m_graph->addNode<CompareNode<Node::Type::LTE>>();
+				ImGui::EndMenu();
+			}
+			
+			if (ImGui::Selectable("If")) n = m_graph->addNode<IfNode>();
 			if (ImGui::Selectable("Self")) n = m_graph->addNode<SelfNode>();
 			if (ImGui::Selectable("Set yaw")) n = m_graph->addNode<SetYawNode>();
 			if (ImGui::Selectable("Mouse move")) n = m_graph->addNode<MouseMoveNode>();
@@ -1230,6 +1342,13 @@ Node* Graph::createNode(Node::Type type) {
 	switch (type) {
 		case Node::Type::ADD: return addNode<AddNode>();
 		case Node::Type::MUL: return addNode<MulNode>();
+		case Node::Type::IF: return addNode<IfNode>();
+		case Node::Type::EQ: return addNode<CompareNode<Node::Type::EQ>>();
+		case Node::Type::NEQ: return addNode<CompareNode<Node::Type::NEQ>>();
+		case Node::Type::LT: return addNode<CompareNode<Node::Type::LT>>();
+		case Node::Type::GT: return addNode<CompareNode<Node::Type::GT>>();
+		case Node::Type::LTE: return addNode<CompareNode<Node::Type::LTE>>();
+		case Node::Type::GTE: return addNode<CompareNode<Node::Type::GTE>>();
 		case Node::Type::SEQUENCE: return addNode<SequenceNode>(*this);
 		case Node::Type::SELF: return addNode<SelfNode>();
 		case Node::Type::SET_YAW: return addNode<SetYawNode>();
