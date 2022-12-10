@@ -64,7 +64,14 @@ struct Node : NodeEditorNode {
 		m_output_pin_counter = 0;
 		ImGuiEx::BeginNode(m_id, m_pos, &m_selected);
 		bool res = onGUI();
+		if (m_error.length() > 0) {
+			ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0xff, 0, 0, 0xff));
+		}
 		ImGuiEx::EndNode();
+		if (m_error.length() > 0) {
+			ImGui::PopStyleColor();
+			if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", m_error.c_str());
+		}
 		return res;
 	}
 	
@@ -82,6 +89,8 @@ struct Node : NodeEditorNode {
 		n.node->generate(writer, graph, n.input_idx);
 	}
 
+	void clearError() { m_error = ""; }
+
 	virtual Type getType() const = 0;
 
 	virtual void generate(kvm_bc_writer& writer, const Graph& graph, u32 output_idx) = 0;
@@ -97,6 +106,7 @@ protected:
 	};
 
 	NodeInput getOutputNode(u32 idx, const Graph& graph);
+	Node(IAllocator& allocator) : m_error(allocator) {}
 
 	struct NodeOutput {
 		Node* node;
@@ -132,6 +142,7 @@ protected:
 	virtual bool onGUI() = 0;
 	u32 m_input_pin_counter = 0;
 	u32 m_output_pin_counter = 0;
+	String m_error;
 };
 
 
@@ -146,6 +157,9 @@ struct Graph {
 	static constexpr u32 MAGIC = '_LVS';
 
 	void generate(OutputMemoryStream& blob) {
+		for (Node* node : m_nodes) {
+			node->clearError();
+		}
 		ScriptResource::Header header;
 		blob.write(header);
 		kvm_u8 bytecode[4096];
@@ -302,6 +316,10 @@ Node::NodeOutput Node::getInputNode(u32 idx, const Graph& graph) {
 
 template <auto T>
 struct CompareNode : Node {
+	CompareNode(IAllocator& allocator)
+		: Node(allocator)
+	{}
+	
 	Type getType() const override { return T; }
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
@@ -331,8 +349,10 @@ struct CompareNode : Node {
 	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
 		NodeOutput a = getInputNode(0, graph);
 		NodeOutput b = getInputNode(1, graph);
-		if (!a) return;
-		if (!b) return;
+		if (!a || !b) {
+			m_error = "Missing input";
+			return;
+		}
 
 		a.generate(writer, graph);
 		b.generate(writer, graph);
@@ -358,6 +378,10 @@ struct CompareNode : Node {
 };
 
 struct IfNode : Node {
+	IfNode(IAllocator& allocator)
+		: Node(allocator)
+	{}
+	
 	Type getType() const override { return Type::IF; }
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
@@ -380,8 +404,14 @@ struct IfNode : Node {
 		NodeInput true_branch = getOutputNode(0, graph);
 		NodeInput false_branch = getOutputNode(1, graph);
 		NodeOutput cond = getInputNode(1, graph);
-		if (!true_branch.node || !false_branch.node) return;
-		if (!cond) return;
+		if (!true_branch.node || !false_branch.node) {
+			m_error = "Missing outputs";
+			return;
+		}
+		if (!cond) {
+			m_error = "Missing condition";
+			return;
+		}
 		
 		kvm_u32 else_label = kvm_bc_create_label(&writer);
 		kvm_u32 endif_label = kvm_bc_create_label(&writer);
@@ -397,7 +427,9 @@ struct IfNode : Node {
 };
 
 struct SequenceNode : Node {
-	SequenceNode(Graph& graph) : m_graph(graph) {}
+	SequenceNode(Graph& graph)
+		: Node(graph.m_allocator)
+		, m_graph(graph) {}
 	Type getType() const override { return Type::SEQUENCE; }
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
@@ -427,6 +459,9 @@ struct SequenceNode : Node {
 };
 
 struct SelfNode : Node {
+	SelfNode(IAllocator& allocator)
+		: Node(allocator)
+	{}
 	Type getType() const override { return Type::SELF; }
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
@@ -444,9 +479,10 @@ struct SelfNode : Node {
 };
 
 struct CallNode : Node {
-	CallNode() {}
-	CallNode(reflection::ComponentBase* component, reflection::FunctionBase* function)
-		: component(component)
+	CallNode(IAllocator& allocator) : Node(allocator) {}
+	CallNode(reflection::ComponentBase* component, reflection::FunctionBase* function, IAllocator& allocator)
+		: Node(allocator)
+		, component(component)
 		, function(function)
 	{}
 
@@ -499,6 +535,9 @@ struct CallNode : Node {
 };
 
 struct SetYawNode : Node {
+	SetYawNode(IAllocator& allocator)
+		: Node(allocator)
+	{}
 	Type getType() const override { return Type::SET_YAW; }
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
@@ -513,8 +552,10 @@ struct SetYawNode : Node {
 	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
 		NodeOutput o1 = getInputNode(1, graph);
 		NodeOutput o2 = getInputNode(2, graph);
-		if (!o1) return;
-		if (!o2) return;
+		if (!o1 || !o2) {
+			m_error = "Missing inputs";
+			return;
+		}
 		
 		kvm_bc_const(&writer, (kvm_u32)ScriptSyscalls::SET_YAW);
 		o1.generate(writer, graph);
@@ -526,6 +567,9 @@ struct SetYawNode : Node {
 };
 
 struct ConstNode : Node {
+	ConstNode(IAllocator& allocator)
+		: Node(allocator)
+	{}
 	Type getType() const override { return Type::CONST; }
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
@@ -546,6 +590,9 @@ struct ConstNode : Node {
 };
 
 struct MouseMoveNode : Node {
+	MouseMoveNode(IAllocator& allocator)
+		: Node(allocator)
+	{}
 	Type getType() const override { return Type::MOUSE_MOVE; }
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
@@ -576,6 +623,9 @@ struct MouseMoveNode : Node {
 };
 
 struct Vec3Node : Node {
+	Vec3Node(IAllocator& allocator)
+		: Node(allocator)
+	{}
 	Type getType() const override { return Type::VEC3; }
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
@@ -594,6 +644,9 @@ struct Vec3Node : Node {
 };
 
 struct YawToDirNode : Node {
+	YawToDirNode(IAllocator& allocator)
+		: Node(allocator)
+	{}
 	Type getType() const override { return Type::YAW_TO_DIR; }
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
@@ -609,6 +662,9 @@ struct YawToDirNode : Node {
 };
 
 struct StartNode : Node {
+	StartNode(IAllocator& allocator)
+		: Node(allocator)
+	{}
 	Type getType() const override { return Type::START; }
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
@@ -626,6 +682,9 @@ struct StartNode : Node {
 };
 
 struct UpdateNode : Node {
+	UpdateNode(IAllocator& allocator) 
+		: Node(allocator)
+	{}
 	Type getType() const override { return Type::UPDATE; }
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
@@ -653,6 +712,9 @@ struct UpdateNode : Node {
 
 
 struct MulNode : Node {
+	MulNode(IAllocator& allocator)
+		: Node(allocator)
+	{}
 	Type getType() const override { return Type::MUL; }
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
@@ -660,7 +722,10 @@ struct MulNode : Node {
 	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
 		NodeOutput n0 = getInputNode(0, graph);
 		NodeOutput n1 = getInputNode(1, graph);
-		if (!n0 || !n1) return;
+		if (!n0 || !n1) {
+			m_error = "Missing inputs";
+			return;
+		}
 
 		n0.generate(writer, graph);
 		n1.generate(writer, graph);
@@ -686,6 +751,9 @@ struct MulNode : Node {
 };
 
 struct AddNode : Node {
+	AddNode(IAllocator& allocator)
+		: Node(allocator)
+	{}
 	Type getType() const override { return Type::ADD; }
 
 	bool hasInputPins() const override { return true; }
@@ -701,7 +769,10 @@ struct AddNode : Node {
 	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
 		NodeOutput n0 = getInputNode(0, graph);
 		NodeOutput n1 = getInputNode(1, graph);
-		if (!n0 || !n1) return;
+		if (!n0 || !n1) {
+			m_error = "Missing inputs";
+			return;
+		}
 
 		n0.generate(writer, graph);
 		n1.generate(writer, graph);
@@ -727,8 +798,15 @@ struct AddNode : Node {
 };
 
 struct SetVariableNode : Node {
-	SetVariableNode(Graph& graph) : m_graph(graph) {}
-	SetVariableNode(Graph& graph, u32 var) : m_graph(graph), m_var(var) {}
+	SetVariableNode(Graph& graph)
+		: Node(graph.m_allocator)
+		, m_graph(graph)
+	{}
+	SetVariableNode(Graph& graph, u32 var)
+		: Node(graph.m_allocator)
+		, m_graph(graph)
+		, m_var(var)
+	{}
 
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
@@ -737,6 +815,10 @@ struct SetVariableNode : Node {
 
 	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
 		NodeOutput n = getInputNode(1, graph);
+		if (!n) {
+			m_error = "Missing input";
+			return;
+		}
 		n.generate(writer, graph);
 		kvm_bc_set(&writer, ((u32)EnvironmentIndices::VARIABLES) + m_var);
 		generateNext(writer, graph);
@@ -759,8 +841,15 @@ struct SetVariableNode : Node {
 };
 
 struct GetVariableNode : Node {
-	GetVariableNode(Graph& graph) : m_graph(graph) {}
-	GetVariableNode(Graph& graph, u32 var) : m_graph(graph), m_var(var) {}
+	GetVariableNode(Graph& graph)
+		: Node(graph.m_allocator)
+		, m_graph(graph)
+	{}
+	GetVariableNode(Graph& graph, u32 var)
+		: Node(graph.m_allocator)
+		, m_graph(graph)
+		, m_var(var)
+	{}
 	Type getType() const override { return Type::GET_VARIABLE; }
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
@@ -786,6 +875,9 @@ struct GetVariableNode : Node {
 };
 
 struct SetPropertyNode : Node {
+	SetPropertyNode(IAllocator& allocator)
+		: Node(allocator)
+	{}	
 	Type getType() const override { return Type::SET_PROPERTY; }
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
@@ -846,7 +938,10 @@ struct SetPropertyNode : Node {
 
 	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
 		NodeOutput o = getInputNode(1, graph);
-		if (!o) return;
+		if (!o) {
+			m_error = "Missing inputs";
+			return;
+		}
 		
 		float v = (float)atof(value);
 
@@ -1108,6 +1203,8 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 
 	void saveAs(const char* path) {
 		ASSERT(path[0]);
+		OutputMemoryStream tmp(m_app.getAllocator());
+		m_graph->generate(tmp); // to update errors
 		OutputMemoryStream blob(m_app.getAllocator());
 		m_graph->serialize(blob);
 		FileSystem& fs = m_app.getEngine().getFileSystem();
@@ -1151,7 +1248,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 		if (m_graph.get()) m_graph.destroy();
 		m_graph.create(m_app.getAllocator());
 		m_path = "";
-		m_graph->addNode<UpdateNode>();
+		m_graph->addNode<UpdateNode>(m_graph->m_allocator);
 		pushUndo(NO_MERGE_UNDO);
 	}
 
@@ -1255,10 +1352,11 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 
 	void onContextMenu(ImVec2 pos) override {
 		ImVec2 cp = ImGui::GetItemRectMin();
+		IAllocator& allocator = m_graph->m_allocator;
 		if (ImGui::BeginMenu("Add node")) {
 			Node* n = nullptr;
-			if (ImGui::Selectable("Add")) n = m_graph->addNode<AddNode>();
-			if (ImGui::Selectable("Multiply")) n = m_graph->addNode<MulNode>();
+			if (ImGui::Selectable("Add")) n = m_graph->addNode<AddNode>(allocator);
+			if (ImGui::Selectable("Multiply")) n = m_graph->addNode<MulNode>(allocator);
 			if (ImGui::BeginMenu("Set variable")) {
 				for (const Variable& var : m_graph->m_variables) {
 					if (var.name.length() > 0 && ImGui::Selectable(var.name.c_str())) {
@@ -1276,26 +1374,26 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 				ImGui::EndMenu();
 			}
 			if (ImGui::BeginMenu("Compare")) {
-				if (ImGui::Selectable("=")) n = m_graph->addNode<CompareNode<Node::Type::EQ>>();
-				if (ImGui::Selectable("<>")) n = m_graph->addNode<CompareNode<Node::Type::NEQ>>();
-				if (ImGui::Selectable("<")) n = m_graph->addNode<CompareNode<Node::Type::LT>>();
-				if (ImGui::Selectable(">")) n = m_graph->addNode<CompareNode<Node::Type::GT>>();
-				if (ImGui::Selectable("<=")) n = m_graph->addNode<CompareNode<Node::Type::GTE>>();
-				if (ImGui::Selectable(">=")) n = m_graph->addNode<CompareNode<Node::Type::LTE>>();
+				if (ImGui::Selectable("=")) n = m_graph->addNode<CompareNode<Node::Type::EQ>>(allocator);
+				if (ImGui::Selectable("<>")) n = m_graph->addNode<CompareNode<Node::Type::NEQ>>(allocator);
+				if (ImGui::Selectable("<")) n = m_graph->addNode<CompareNode<Node::Type::LT>>(allocator);
+				if (ImGui::Selectable(">")) n = m_graph->addNode<CompareNode<Node::Type::GT>>(allocator);
+				if (ImGui::Selectable("<=")) n = m_graph->addNode<CompareNode<Node::Type::GTE>>(allocator);
+				if (ImGui::Selectable(">=")) n = m_graph->addNode<CompareNode<Node::Type::LTE>>(allocator);
 				ImGui::EndMenu();
 			}
 			
-			if (ImGui::Selectable("If")) n = m_graph->addNode<IfNode>();
-			if (ImGui::Selectable("Self")) n = m_graph->addNode<SelfNode>();
-			if (ImGui::Selectable("Set yaw")) n = m_graph->addNode<SetYawNode>();
-			if (ImGui::Selectable("Mouse move")) n = m_graph->addNode<MouseMoveNode>();
-			if (ImGui::Selectable("Constant")) n = m_graph->addNode<ConstNode>();
-			if (ImGui::Selectable("Set property")) n = m_graph->addNode<SetPropertyNode>();
-			if (ImGui::Selectable("Update")) n = m_graph->addNode<UpdateNode>();
-			if (ImGui::Selectable("Vector 3")) n = m_graph->addNode<Vec3Node>();
-			if (ImGui::Selectable("Yaw to direction")) n = m_graph->addNode<YawToDirNode>();
+			if (ImGui::Selectable("If")) n = m_graph->addNode<IfNode>(allocator);
+			if (ImGui::Selectable("Self")) n = m_graph->addNode<SelfNode>(allocator);
+			if (ImGui::Selectable("Set yaw")) n = m_graph->addNode<SetYawNode>(allocator);
+			if (ImGui::Selectable("Mouse move")) n = m_graph->addNode<MouseMoveNode>(allocator);
+			if (ImGui::Selectable("Constant")) n = m_graph->addNode<ConstNode>(allocator);
+			if (ImGui::Selectable("Set property")) n = m_graph->addNode<SetPropertyNode>(allocator);
+			if (ImGui::Selectable("Update")) n = m_graph->addNode<UpdateNode>(allocator);
+			if (ImGui::Selectable("Vector 3")) n = m_graph->addNode<Vec3Node>(allocator);
+			if (ImGui::Selectable("Yaw to direction")) n = m_graph->addNode<YawToDirNode>(allocator);
 			if (ImGui::Selectable("Sequence")) n = m_graph->addNode<SequenceNode>(*m_graph);
-			if (ImGui::Selectable("Start")) n = m_graph->addNode<StartNode>();
+			if (ImGui::Selectable("Start")) n = m_graph->addNode<StartNode>(allocator);
 			if (n) {
 				n->m_pos = pos;
 				pushUndo(NO_MERGE_UNDO);
@@ -1308,7 +1406,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 				if (!rcmp.cmp->functions.empty() && ImGui::BeginMenu(rcmp.cmp->name)) {
 					for (reflection::FunctionBase* f : rcmp.cmp->functions) {
 						if (ImGui::Selectable(f->name)) {
-							m_graph->addNode<CallNode>(rcmp.cmp, f);
+							m_graph->addNode<CallNode>(rcmp.cmp, f, allocator);
 							pushUndo(NO_MERGE_UNDO);
 						}
 					}
@@ -1340,28 +1438,28 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 
 Node* Graph::createNode(Node::Type type) {
 	switch (type) {
-		case Node::Type::ADD: return addNode<AddNode>();
-		case Node::Type::MUL: return addNode<MulNode>();
-		case Node::Type::IF: return addNode<IfNode>();
-		case Node::Type::EQ: return addNode<CompareNode<Node::Type::EQ>>();
-		case Node::Type::NEQ: return addNode<CompareNode<Node::Type::NEQ>>();
-		case Node::Type::LT: return addNode<CompareNode<Node::Type::LT>>();
-		case Node::Type::GT: return addNode<CompareNode<Node::Type::GT>>();
-		case Node::Type::LTE: return addNode<CompareNode<Node::Type::LTE>>();
-		case Node::Type::GTE: return addNode<CompareNode<Node::Type::GTE>>();
+		case Node::Type::ADD: return addNode<AddNode>(m_allocator);
+		case Node::Type::MUL: return addNode<MulNode>(m_allocator);
+		case Node::Type::IF: return addNode<IfNode>(m_allocator);
+		case Node::Type::EQ: return addNode<CompareNode<Node::Type::EQ>>(m_allocator);
+		case Node::Type::NEQ: return addNode<CompareNode<Node::Type::NEQ>>(m_allocator);
+		case Node::Type::LT: return addNode<CompareNode<Node::Type::LT>>(m_allocator);
+		case Node::Type::GT: return addNode<CompareNode<Node::Type::GT>>(m_allocator);
+		case Node::Type::LTE: return addNode<CompareNode<Node::Type::LTE>>(m_allocator);
+		case Node::Type::GTE: return addNode<CompareNode<Node::Type::GTE>>(m_allocator);
 		case Node::Type::SEQUENCE: return addNode<SequenceNode>(*this);
-		case Node::Type::SELF: return addNode<SelfNode>();
-		case Node::Type::SET_YAW: return addNode<SetYawNode>();
-		case Node::Type::CONST: return addNode<ConstNode>();
-		case Node::Type::MOUSE_MOVE: return addNode<MouseMoveNode>();
-		case Node::Type::START: return addNode<StartNode>();
-		case Node::Type::UPDATE: return addNode<UpdateNode>();
-		case Node::Type::VEC3: return addNode<Vec3Node>();
-		case Node::Type::CALL: return addNode<CallNode>();
+		case Node::Type::SELF: return addNode<SelfNode>(m_allocator);
+		case Node::Type::SET_YAW: return addNode<SetYawNode>(m_allocator);
+		case Node::Type::CONST: return addNode<ConstNode>(m_allocator);
+		case Node::Type::MOUSE_MOVE: return addNode<MouseMoveNode>(m_allocator);
+		case Node::Type::START: return addNode<StartNode>(m_allocator);
+		case Node::Type::UPDATE: return addNode<UpdateNode>(m_allocator);
+		case Node::Type::VEC3: return addNode<Vec3Node>(m_allocator);
+		case Node::Type::CALL: return addNode<CallNode>(m_allocator);
 		case Node::Type::GET_VARIABLE: return addNode<GetVariableNode>(*this);
 		case Node::Type::SET_VARIABLE: return addNode<SetVariableNode>(*this);
-		case Node::Type::SET_PROPERTY: return addNode<SetPropertyNode>();
-		case Node::Type::YAW_TO_DIR: return addNode<YawToDirNode>();
+		case Node::Type::SET_PROPERTY: return addNode<SetPropertyNode>(m_allocator);
+		case Node::Type::YAW_TO_DIR: return addNode<YawToDirNode>(m_allocator);
 	}
 	return nullptr;
 }
