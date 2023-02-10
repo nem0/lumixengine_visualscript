@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/plugin.h"
+#include "../external/wasm3.h"
 
 namespace Lumix {
 
@@ -21,6 +22,7 @@ enum class EnvironmentIndices {
 enum class ScriptSyscalls : u32 {
 	SET_PROPERTY,
 	SET_YAW,
+	CALL_CMP_METHOD,
 };
 
 struct ScriptResource : Resource {
@@ -47,10 +49,6 @@ struct ScriptResource : Resource {
 
 	IAllocator& m_allocator;
 	OutputMemoryStream m_bytecode;
-	u32 m_update_label;
-	u32 m_start_label;
-	u32 m_mouse_move_label;
-	Array<Variable> m_variables;
 };
 
 struct Script {
@@ -58,8 +56,10 @@ struct Script {
 	Script(Script&& script);
 	~Script();
 
+	bool m_init_failed = false;
+	IM3Runtime m_runtime = nullptr;
+	IM3Module m_module = nullptr;
 	ScriptResource* m_resource = nullptr;
-	OutputMemoryStream m_environment;
 };
 
 struct ScriptScene : IScene {

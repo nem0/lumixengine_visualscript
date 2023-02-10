@@ -15,7 +15,7 @@
 #include "engine/stream.h"
 #include "engine/universe.h"
 #include "../script.h"
-#include "../../external/kvm.h"
+#include "../m3_lumix.h"
 
 #include "imgui/imgui.h"
 
@@ -32,6 +32,33 @@ struct Variable {
 };
 
 struct Graph;
+
+enum class WASMExportType : u8 {
+	FUNCTION = 0,
+	TABLE = 1,
+	MEMORY = 2,
+	GLOBAL = 3
+};
+
+enum class WASMType : u8 {
+	F64 = 0x7C,
+	F32 = 0x7D,
+	I64 = 0x7E,
+	I32 = 0x7F
+};
+
+enum class WasmOp : u8 {
+	END = 0x0B,
+	LOCAL_GET = 0x20,
+	GLOBAL_GET = 0x23,
+	GLOBAL_SET = 0x24,
+	I32_CONST = 0x41,
+	F32_CONST = 0x43,
+	I32_ADD = 0x6A,
+	I32_MUL = 0x6C,
+	F32_ADD = 0x92,
+	F32_MUL = 0x94,
+};
 
 struct Node : NodeEditorNode {
 	enum class Type : u32 {
@@ -56,7 +83,8 @@ struct Node : NodeEditorNode {
 		GT,
 		LT,
 		GTE,
-		LTE
+		LTE,
+		KEY_INPUT
 	};
 
 	bool nodeGUI() override {
@@ -83,17 +111,17 @@ struct Node : NodeEditorNode {
 		ImGuiEx::EndNodeTitleBar();
 	}
 
-	void generateNext(kvm_bc_writer& writer, const Graph& graph) {
+	void generateNext(OutputMemoryStream& blob, const Graph& graph) {
 		NodeInput n = getOutputNode(0, graph);
 		if (!n.node) return;
-		n.node->generate(writer, graph, n.input_idx);
+		n.node->generate(blob, graph, n.input_idx);
 	}
 
 	void clearError() { m_error = ""; }
 
 	virtual Type getType() const = 0;
 
-	virtual void generate(kvm_bc_writer& writer, const Graph& graph, u32 output_idx) = 0;
+	virtual void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) = 0;
 	virtual void serialize(OutputMemoryStream& blob) const {}
 	virtual void deserialize(InputMemoryStream& blob) {}
 	virtual ScriptValueType getOutputType(u32 idx, const Graph& graph) { return ScriptValueType::U32; }
@@ -112,8 +140,8 @@ protected:
 		Node* node;
 		u32 output_idx;
 		operator bool() const { return node; }
-		void generate(kvm_bc_writer& writer, const Graph& graph) {
-			node->generate(writer, graph, output_idx);
+		void generate(OutputMemoryStream& blob, const Graph& graph) {
+			node->generate(blob, graph, output_idx);
 		}
 	};
 
@@ -145,6 +173,14 @@ protected:
 	String m_error;
 };
 
+static void writeLEB128(OutputMemoryStream& blob, u32 val) {
+	do {
+		u8 byte = val & 0x7f;
+		val >>= 7;
+		if (val != 0) byte |= 0x80;
+		blob.write(byte);
+	} while (val != 0);
+}
 
 struct Graph {
 	Graph(IAllocator& allocator)
@@ -156,49 +192,170 @@ struct Graph {
 
 	static constexpr u32 MAGIC = '_LVS';
 
+	enum class Section : u8 {
+		TYPE = 1,
+		IMPORT = 2,
+		FUNCTION = 3,
+		TABLE = 4,
+		MEMORY = 5,
+		GLOBAL = 6,
+		EXPORT = 7,
+		START = 8,
+		ELEMENT = 9,
+		CODE = 10,
+		DATA = 11,
+		DATA_COUNT = 12
+	};
+
+	static u32 sizeofLEB128(u32 val) {
+		u32 res = 0;
+		do {
+			++res;
+			val >>= 7;
+		} while (val != 0);
+		return res;
+	}
+
+	void generateExports(OutputMemoryStream& blob) const {
+		writeLEB128(blob, m_variables.size() + 1); // num exports
+		writeLEB128(blob, 6); // string length
+		blob.write("update", 6);
+		blob.write(WASMExportType::FUNCTION);	// type
+		blob.write(u8(0));	// export index
+		
+		for (const Variable& var : m_variables) {
+			writeLEB128(blob, var.name.length());
+			blob.write(var.name.c_str(), var.name.length());
+			blob.write(WASMExportType::GLOBAL); // type
+			const u32 idx = u32(&var - m_variables.begin());
+			writeLEB128(blob, idx); // globla idx
+		}
+	}
+
+	void generateGlobals(OutputMemoryStream& blob) const {
+		writeLEB128(blob, m_variables.size()); // num globals
+		for (const Variable& var : m_variables) {
+			switch (var.type) {
+				case ScriptValueType::U32:
+				case ScriptValueType::I32:
+					blob.write(WASMType::I32);
+					break;
+				case ScriptValueType::FLOAT:
+					blob.write(WASMType::F32);
+					break;
+				default: ASSERT(false); break;
+			}
+			blob.write(u8(1)); // mutable
+			switch (var.type) {
+				case ScriptValueType::U32:
+				case ScriptValueType::I32:
+					blob.write(WasmOp::I32_CONST);
+					blob.write(u8(0));
+					break;
+				case ScriptValueType::FLOAT:
+					blob.write(WasmOp::F32_CONST);
+					blob.write(0.f);
+					break;
+				default: ASSERT(false); break;
+			}
+		}
+		blob.write(WasmOp::END);
+	}
+
 	void generate(OutputMemoryStream& blob) {
 		for (Node* node : m_nodes) {
 			node->clearError();
 		}
 		ScriptResource::Header header;
 		blob.write(header);
+
+		blob.write(u32(0x6d736100));
+		blob.write(u32(1));
+
+		blob.write(Section::TYPE);
+		blob.write(u8(5));	// num bytes
+		blob.write(u8(1));	// num funcs
+		blob.write(u8(0x60));	// func
+		blob.write(u8(1));		// num args
+		blob.write(WASMType::F32);	// f32
+		blob.write(u8(0));		// num results
+
+		blob.write(Section::FUNCTION);
+		blob.write(u8(2));	// num bytes
+		blob.write(u8(1));	// num funcs
+		blob.write(u8(0));	// func 0 signature index
+
+		OutputMemoryStream global_blob(m_allocator);
+		generateGlobals(global_blob);
+		blob.write(Section::GLOBAL);
+		writeLEB128(blob, (u32)global_blob.size());
+		blob.write(global_blob.data(), global_blob.size());	
+
+		OutputMemoryStream exports_blob(m_allocator);
+		generateExports(exports_blob);
+		blob.write(Section::EXPORT);
+		writeLEB128(blob, (u32)exports_blob.size());
+		blob.write(exports_blob.data(), exports_blob.size());	
+
+		OutputMemoryStream func_blob(m_allocator);
+		for (Node* node : m_nodes) {
+			if (node->getType() == Node::Type::UPDATE) {
+				node->generate(func_blob, *this, 0);
+				break;
+			}
+		}
+
+		blob.write(Section::CODE);
+		writeLEB128(blob, (u32)func_blob.size() + 1 + sizeofLEB128((u32)func_blob.size()));
+		blob.write(u8(1));	// num funcs
+		writeLEB128(blob, (u32)func_blob.size());
+		blob.write(func_blob.data(), func_blob.size());
+
+#if 0
 		kvm_u8 bytecode[4096];
-		kvm_bc_writer writer;
-		kvm_bc_start_write(&writer, bytecode, sizeof(bytecode));
-		kvm_label update_label = kvm_bc_create_label(&writer);
-		kvm_label start_label = kvm_bc_create_label(&writer);
-		kvm_label mouse_move_label = kvm_bc_create_label(&writer);
+		kvm_bc_blob blob;
+		kvm_bc_start_write(&blob, bytecode, sizeof(bytecode));
+		kvm_label update_label = kvm_bc_create_label(&blob);
+		kvm_label start_label = kvm_bc_create_label(&blob);
+		kvm_label mouse_move_label = kvm_bc_create_label(&blob);
+		kvm_label key_input_label = kvm_bc_create_label(&blob);
 		for (Node* node : m_nodes) {
 			switch (node->getType()) {
+				case Node::Type::KEY_INPUT:
+					kvm_bc_place_label(&blob, key_input_label);
+					node->generate(blob, *this, 0);
+					break;
 				case Node::Type::MOUSE_MOVE:
-					kvm_bc_place_label(&writer, mouse_move_label);
-					node->generate(writer, *this, 0);
+					kvm_bc_place_label(&blob, mouse_move_label);
+					node->generate(blob, *this, 0);
 					break;
 				case Node::Type::START:
-					kvm_bc_place_label(&writer, start_label);
-					node->generate(writer, *this, 0);
+					kvm_bc_place_label(&blob, start_label);
+					node->generate(blob, *this, 0);
 					break;
 				case Node::Type::UPDATE:
-					kvm_bc_place_label(&writer, update_label);
-					node->generate(writer, *this, 0);
+					kvm_bc_place_label(&blob, update_label);
+					node->generate(blob, *this, 0);
 					break;
 				default: break;
 			}
 		}
-		kvm_bc_end(&writer);
-		kvm_bc_end_write(&writer);
+		kvm_bc_end(&blob);
+		kvm_bc_end_write(&blob);
 		
-		blob.write(writer.labels[update_label]);
-		blob.write(writer.labels[start_label]);
-		blob.write(writer.labels[mouse_move_label]);
+		blob.write(blob.labels[update_label]);
+		blob.write(blob.labels[start_label]);
+		blob.write(blob.labels[mouse_move_label]);
+		blob.write(blob.labels[key_input_label]);
 		blob.write(m_variables.size());
 		for (const Variable& v : m_variables) {
 			blob.writeString(v.name.c_str());
 			blob.write(v.type);
 		}
-		const u32 bytecode_size = u32(writer.ip - bytecode);
+		const u32 bytecode_size = u32(blob.ip - bytecode);
 		blob.write(bytecode_size);
-		blob.write(bytecode, writer.ip - bytecode);
+		blob.write(bytecode, blob.ip - bytecode);
+#endif
 	}
 
 	bool deserialize(InputMemoryStream& blob) {
@@ -349,7 +506,8 @@ struct CompareNode : Node {
 		return false;
 	}
 
-	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
+#if 0 // TODO
 		NodeOutput a = getInputNode(0, graph);
 		NodeOutput b = getInputNode(1, graph);
 		if (!a || !b) {
@@ -357,26 +515,27 @@ struct CompareNode : Node {
 			return;
 		}
 
-		a.generate(writer, graph);
-		b.generate(writer, graph);
+		a.generate(blob, graph);
+		b.generate(blob, graph);
 
 		if (getOutputType(0, graph) == ScriptValueType::FLOAT) {
 			switch (T) {
-				case Type::EQ: kvm_bc_eq(&writer); return;
-				case Type::NEQ: kvm_bc_neq(&writer); return;
-				case Type::LT: kvm_bc_ltf(&writer); return;
-				case Type::GT: kvm_bc_gtf(&writer); return;
+				case Type::EQ: kvm_bc_eq(&blob); return;
+				case Type::NEQ: kvm_bc_neq(&blob); return;
+				case Type::LT: kvm_bc_ltf(&blob); return;
+				case Type::GT: kvm_bc_gtf(&blob); return;
 				default: ASSERT(false); return;
 			}
 		}
 
 		switch (T) {
-			case Type::EQ: kvm_bc_eq(&writer); break;
-			case Type::NEQ: kvm_bc_neq(&writer); break;
-			case Type::LT: kvm_bc_lt(&writer); break;
-			case Type::GT: kvm_bc_gt(&writer); break;
+			case Type::EQ: kvm_bc_eq(&blob); break;
+			case Type::NEQ: kvm_bc_neq(&blob); break;
+			case Type::LT: kvm_bc_lt(&blob); break;
+			case Type::GT: kvm_bc_gt(&blob); break;
 			default: ASSERT(false); break;
 		}
+#endif
 	}
 };
 
@@ -403,7 +562,7 @@ struct IfNode : Node {
 		return false;
 	}
 
-	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
 		NodeInput true_branch = getOutputNode(0, graph);
 		NodeInput false_branch = getOutputNode(1, graph);
 		NodeOutput cond = getInputNode(1, graph);
@@ -416,16 +575,18 @@ struct IfNode : Node {
 			return;
 		}
 		
-		kvm_u32 else_label = kvm_bc_create_label(&writer);
-		kvm_u32 endif_label = kvm_bc_create_label(&writer);
+#if 0 // TODO
+		kvm_u32 else_label = kvm_bc_create_label(&blob);
+		kvm_u32 endif_label = kvm_bc_create_label(&blob);
 		
-		cond.generate(writer, graph);
-		kvm_bc_jmp(&writer, else_label);
-		true_branch.node->generate(writer, graph, 0);
-		kvm_bc_jmp(&writer, endif_label);
-		kvm_bc_place_label(&writer, else_label);
-		false_branch.node->generate(writer, graph, 0);
-		kvm_bc_place_label(&writer, endif_label);
+		cond.generate(blob, graph);
+		kvm_bc_jmp(&blob, else_label);
+		true_branch.node->generate(blob, graph, 0);
+		kvm_bc_jmp(&blob, endif_label);
+		kvm_bc_place_label(&blob, else_label);
+		false_branch.node->generate(blob, graph, 0);
+		kvm_bc_place_label(&blob, endif_label);
+#endif
 	}
 };
 
@@ -451,11 +612,11 @@ struct SequenceNode : Node {
 		return false;
 	}
 	
-	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
 		for (u32 i = 0; ; ++i) {
 			NodeInput n = getOutputNode(i, graph);
 			if (!n.node) return;
-			n.node->generate(writer, graph, 0);
+			n.node->generate(blob, graph, 0);
 		}
 	}
 	Graph& m_graph;
@@ -476,8 +637,10 @@ struct SelfNode : Node {
 	
 	ScriptValueType getOutputType(u32 idx, const Graph& graph) override { return ScriptValueType::ENTITY; }
 
-	void generate(kvm_bc_writer& writer, const Graph&, u32) override {
-		kvm_bc_get(&writer, (kvm_i32)EnvironmentIndices::SELF);
+	void generate(OutputMemoryStream& blob, const Graph&, u32) override {
+#if 0 // TODO
+		kvm_bc_get(&blob, (kvm_i32)EnvironmentIndices::SELF);
+#endif
 	}
 };
 
@@ -531,7 +694,16 @@ struct CallNode : Node {
 		}
 		return false;
 	}
-	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {}
+
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
+#if 0 // TODO
+		kvm_bc_const(&blob, (kvm_u32)ScriptSyscalls::CALL_CMP_METHOD);
+		kvm_bc_const64(&blob, RuntimeHash(component->name).getHashValue());
+		kvm_bc_const64(&blob, RuntimeHash(function->name).getHashValue());
+		ASSERT(function->getArgCount() == 0);
+		kvm_bc_syscall(&blob, 5);
+#endif
+	}
 
 	const reflection::ComponentBase* component = nullptr;
 	const reflection::FunctionBase* function = nullptr;
@@ -552,7 +724,7 @@ struct SetYawNode : Node {
 		return false;
 	}
 
-	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
 		NodeOutput o1 = getInputNode(1, graph);
 		NodeOutput o2 = getInputNode(2, graph);
 		if (!o1 || !o2) {
@@ -560,12 +732,14 @@ struct SetYawNode : Node {
 			return;
 		}
 		
-		kvm_bc_const(&writer, (kvm_u32)ScriptSyscalls::SET_YAW);
-		o1.generate(writer, graph);
-		o2.generate(writer, graph);
-		kvm_bc_syscall(&writer, 3);
+#if 0 // TODO
+		kvm_bc_const(&blob, (kvm_u32)ScriptSyscalls::SET_YAW);
+		o1.generate(blob, graph);
+		o2.generate(blob, graph);
+		kvm_bc_syscall(&blob, 3);
 
-		generateNext(writer, graph);
+		generateNext(blob, graph);
+#endif
 	}
 };
 
@@ -585,11 +759,31 @@ struct ConstNode : Node {
 		return ImGui::DragFloat("##v", &m_value);
 	}
 
-	void generate(kvm_bc_writer& writer, const Graph& graph, u32 output_idx) override {
-		kvm_bc_const_float(&writer, m_value);
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {
+		blob.write(WasmOp::F32_CONST);
+		blob.write(m_value);
 	}
 
 	float m_value = 0;
+};
+
+struct KeyInputNode : Node {
+	KeyInputNode(IAllocator& allocator)
+		: Node(allocator)
+	{}
+	Type getType() const override { return Type::KEY_INPUT; }
+	bool hasInputPins() const override { return false; }
+	bool hasOutputPins() const override { return true; }
+
+	ScriptValueType getOutputType(u32 idx, const Graph& graph) { return ScriptValueType::U32; }
+
+	bool onGUI() override {
+		nodeTitle(ICON_FA_KEY " Key input", false, true);
+		outputPin(); ImGui::TextUnformatted("Key");
+		return false;
+	}
+
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {}
 };
 
 struct MouseMoveNode : Node {
@@ -611,19 +805,21 @@ struct MouseMoveNode : Node {
 	}
 	
 	
-	void generate(kvm_bc_writer& writer, const Graph& graph, u32 output_idx) override {
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {
+#if 0 // TODO
 		switch (output_idx) {
 			case 0: {
 				NodeInput o = getOutputNode(0, graph);
-				if(o.node) o.node->generate(writer, graph, o.input_idx);
-				kvm_bc_end(&writer);
+				if(o.node) o.node->generate(blob, graph, o.input_idx);
+				kvm_bc_end(&blob);
 				break;
 			}
 			case 1:
 			case 2:
-				kvm_bc_get_local(&writer, output_idx - 1);	
+				kvm_bc_get_local(&blob, output_idx - 1);	
 				break;
 		}
+#endif
 	}
 };
 
@@ -645,7 +841,7 @@ struct Vec3Node : Node {
 		outputPin();
 		return false;
 	}
-	void generate(kvm_bc_writer& writer, const Graph&, u32) override {}
+	void generate(OutputMemoryStream& blob, const Graph&, u32) override {}
 };
 
 struct YawToDirNode : Node {
@@ -663,7 +859,7 @@ struct YawToDirNode : Node {
 		return false;
 	}
 
-	void generate(kvm_bc_writer& writer, const Graph&, u32) override {}
+	void generate(OutputMemoryStream& blob, const Graph&, u32) override {}
 };
 
 struct StartNode : Node {
@@ -679,10 +875,12 @@ struct StartNode : Node {
 		return false;
 	}
 
-	void generate(kvm_bc_writer& writer, const Graph& graph, u32 pin_idx) override {
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32 pin_idx) override {
+#if 0 // TODO
 		NodeInput o = getOutputNode(0, graph);
-		if(o.node) o.node->generate(writer, graph, o.input_idx);
-		kvm_bc_end(&writer);
+		if(o.node) o.node->generate(blob, graph, o.input_idx);
+		kvm_bc_end(&blob);
+#endif
 	}
 };
 
@@ -703,14 +901,16 @@ struct UpdateNode : Node {
 	
 	ScriptValueType getOutputType(u32 idx, const Graph& graph) override { return ScriptValueType::FLOAT; }
 
-	void generate(kvm_bc_writer& writer, const Graph& graph, u32 pin_idx) override {
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32 pin_idx) override {
 		if (pin_idx == 0) {
+			blob.write(u8(0)); // num locals
 			NodeInput o = getOutputNode(0, graph);
-			if(o.node) o.node->generate(writer, graph, o.input_idx);
-			kvm_bc_end(&writer);
+			if(o.node) o.node->generate(blob, graph, o.input_idx);
+			blob.write(WasmOp::END);
 		}
 		else {
-			kvm_bc_get_local(&writer, 0);	
+			blob.write(WasmOp::LOCAL_GET);
+			blob.write(u8(0));
 		}
 	}
 };
@@ -724,7 +924,7 @@ struct MulNode : Node {
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
 
-	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
 		NodeOutput n0 = getInputNode(0, graph);
 		NodeOutput n1 = getInputNode(1, graph);
 		if (!n0 || !n1) {
@@ -732,12 +932,12 @@ struct MulNode : Node {
 			return;
 		}
 
-		n0.generate(writer, graph);
-		n1.generate(writer, graph);
+		n0.generate(blob, graph);
+		n1.generate(blob, graph);
 		if (n0.node->getOutputType(n0.output_idx, graph) == ScriptValueType::FLOAT)
-			kvm_bc_mulf(&writer);
+			blob.write(WasmOp::F32_MUL);
 		else
-			kvm_bc_mul(&writer);
+			blob.write(WasmOp::I32_MUL);
 	}
 
 	bool onGUI() override {
@@ -771,7 +971,7 @@ struct AddNode : Node {
 	}
 
 
-	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
 		NodeOutput n0 = getInputNode(0, graph);
 		NodeOutput n1 = getInputNode(1, graph);
 		if (!n0 || !n1) {
@@ -779,12 +979,12 @@ struct AddNode : Node {
 			return;
 		}
 
-		n0.generate(writer, graph);
-		n1.generate(writer, graph);
+		n0.generate(blob, graph);
+		n1.generate(blob, graph);
 		if (n0.node->getOutputType(n0.output_idx, graph) == ScriptValueType::FLOAT)
-			kvm_bc_addf(&writer);
+			blob.write(WasmOp::F32_ADD);
 		else
-			kvm_bc_add(&writer);
+			blob.write(WasmOp::I32_ADD);
 	}
 
 	bool onGUI() override {
@@ -818,15 +1018,16 @@ struct SetVariableNode : Node {
 
 	Type getType() const override { return Type::SET_VARIABLE; }
 
-	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
 		NodeOutput n = getInputNode(1, graph);
 		if (!n) {
 			m_error = "Missing input";
 			return;
 		}
-		n.generate(writer, graph);
-		kvm_bc_set(&writer, ((u32)EnvironmentIndices::VARIABLES) + m_var);
-		generateNext(writer, graph);
+		n.generate(blob, graph);
+		blob.write(WasmOp::GLOBAL_SET);
+		writeLEB128(blob, m_var);
+		generateNext(blob, graph);
 	}
 
 	bool onGUI() override {
@@ -863,11 +1064,11 @@ struct GetVariableNode : Node {
 		return graph.m_variables[m_var].type;
 	}
 
-	void generate(kvm_bc_writer& writer, const Graph&, u32) override {
-		kvm_bc_get(&writer, ((u32)EnvironmentIndices::VARIABLES) + m_var);
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
+		blob.write(WasmOp::GLOBAL_GET);
+		writeLEB128(blob, m_var);
 	}
-	
-	
+
 	bool onGUI() override {
 		outputPin();
 		const char* var_name = m_var < (u32)m_graph.m_variables.size() ? m_graph.m_variables[m_var].name.c_str() : "N/A";
@@ -941,7 +1142,7 @@ struct SetPropertyNode : Node {
 	}
 
 
-	void generate(kvm_bc_writer& writer, const Graph& graph, u32) override {
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
 		NodeOutput o = getInputNode(1, graph);
 		if (!o) {
 			m_error = "Missing inputs";
@@ -950,16 +1151,17 @@ struct SetPropertyNode : Node {
 		
 		float v = (float)atof(value);
 
-		kvm_bc_const(&writer, (kvm_u32)ScriptSyscalls::SET_PROPERTY);
-		kvm_bc_const64(&writer, reflection::getPropertyHash(cmp_type, prop).getHashValue());
-		kvm_bc_const(&writer, cmp_type.index);
+#if 0 // TODO
+		kvm_bc_const(&blob, (kvm_u32)ScriptSyscalls::SET_PROPERTY);
+		kvm_bc_const64(&blob, reflection::getPropertyHash(cmp_type, prop).getHashValue());
+		kvm_bc_const(&blob, cmp_type.index);
 
-		o.node->generate(writer, graph, o.output_idx);
+		o.node->generate(blob, graph, o.output_idx);
 
-		kvm_bc_const_float(&writer, v);
-		kvm_bc_syscall(&writer, 6);
-
-		generateNext(writer, graph);
+		kvm_bc_const_float(&blob, v);
+		kvm_bc_syscall(&blob, 6);
+#endif
+		generateNext(blob, graph);
 	}
 
 	bool onGUI() override {
@@ -991,27 +1193,27 @@ struct VisualScriptPropertyGridPlugin : PropertyGrid::IPlugin {
 		
 		if (!script.m_resource) return;
 		if (!script.m_resource->isReady()) return;
-		if (script.m_environment.empty()) return;
+		if (!script.m_module) return;
 
-		InputMemoryStream blob(script.m_environment);
-		blob.skip((u32)EnvironmentIndices::VARIABLES * sizeof(u32));
-		for (const ScriptResource::Variable& var : script.m_resource->m_variables) {
-			switch(var.type) {
-				case ScriptValueType::FLOAT: {
-					float f = blob.read<float>();
-					ImGui::LabelText(var.name.c_str(), "%f", f);
+		for (i32 i = 0; i < m3l_getGlobalCount(script.m_module); ++i) {
+			const char* name = m3l_getGlobalName(script.m_module, i);
+			if (!name) continue;
+			IM3Global global = m3_FindGlobal(script.m_module, name);
+			M3TaggedValue val;
+			m3_GetGlobal(global, &val);
+			switch (val.type) {
+				case M3ValueType::c_m3Type_none:
+				case M3ValueType::c_m3Type_unknown:
+				case M3ValueType::c_m3Type_i64:
+				case M3ValueType::c_m3Type_f64:
+					ASSERT(false); // TODO
 					break;
-				}
-				case ScriptValueType::I32:
-				case ScriptValueType::U32: {
-					u32 v = blob.read<u32>();
-					ImGui::LabelText(var.name.c_str(), "%d", v);
+				case M3ValueType::c_m3Type_i32:
+					ImGui::LabelText(name, "%d", val.value.i32);
 					break;
-				}
-				case ScriptValueType::ENTITY: {
-					blob.read<EntityPtr>();
+				case M3ValueType::c_m3Type_f32:
+					ImGui::LabelText(name, "%f", val.value.f32);
 					break;
-				}
 			}
 		}
 	}
@@ -1033,23 +1235,38 @@ struct VisualScriptAssetPlugin : AssetBrowser::Plugin, AssetCompiler::IPlugin {
 	ResourceType getResourceType() const override { return ScriptResource::TYPE; }
 
 	bool compile(const Path& src) override {
-		Graph graph(m_app.getAllocator());
-		FileSystem& fs = m_app.getEngine().getFileSystem();
+		if (Path::hasExtension(src.c_str(), "wasm")) {
+			ScriptResource::Header header;
+			OutputMemoryStream compiled(m_app.getAllocator());
+			compiled.write(header);
+			FileSystem& fs = m_app.getEngine().getFileSystem();
+			OutputMemoryStream wasm(m_app.getAllocator());
+			if (!fs.getContentSync(src, wasm)) {
+				logError("Failed to read ", src);
+				return false;
+			}
+			compiled.write(wasm.data(), wasm.size());
+			return m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (i32)compiled.size()));
+		}
+		else {
+			Graph graph(m_app.getAllocator());
+			FileSystem& fs = m_app.getEngine().getFileSystem();
 		
-		OutputMemoryStream blob(m_app.getAllocator());
-		if (!fs.getContentSync(src, blob)) {
-			logError("Failed to read ", src);
-			return false;
-		}
-		InputMemoryStream iblob(blob);
-		if (!graph.deserialize(iblob)) {
-			logError("Failed to deserialize ", src);
-			return false;
-		}
+			OutputMemoryStream blob(m_app.getAllocator());
+			if (!fs.getContentSync(src, blob)) {
+				logError("Failed to read ", src);
+				return false;
+			}
+			InputMemoryStream iblob(blob);
+			if (!graph.deserialize(iblob)) {
+				logError("Failed to deserialize ", src);
+				return false;
+			}
 
-		OutputMemoryStream compiled(m_app.getAllocator());
-		graph.generate(compiled);
-		return m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (i32)compiled.size()));
+			OutputMemoryStream compiled(m_app.getAllocator());
+			graph.generate(compiled);
+			return m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (i32)compiled.size()));
+		}
 	}
 
 	StudioApp& m_app;
@@ -1090,7 +1307,8 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 
 		AssetCompiler& compiler = app.getAssetCompiler();
 		compiler.registerExtension("lvs", ScriptResource::TYPE);
-		const char* exts[] = { "lvs", nullptr };
+		compiler.registerExtension("wasm", ScriptResource::TYPE);
+		const char* exts[] = { "lvs", "wasm", nullptr };
 		compiler.addPlugin(m_asset_plugin, exts);
 
 		app.getAssetBrowser().addPlugin(m_asset_plugin);
@@ -1392,6 +1610,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 			if (ImGui::Selectable("Self")) n = m_graph->addNode<SelfNode>(allocator);
 			if (ImGui::Selectable("Set yaw")) n = m_graph->addNode<SetYawNode>(allocator);
 			if (ImGui::Selectable("Mouse move")) n = m_graph->addNode<MouseMoveNode>(allocator);
+			if (ImGui::Selectable("Key Input")) n = m_graph->addNode<KeyInputNode>(allocator);
 			if (ImGui::Selectable("Constant")) n = m_graph->addNode<ConstNode>(allocator);
 			if (ImGui::Selectable("Set property")) n = m_graph->addNode<SetPropertyNode>(allocator);
 			if (ImGui::Selectable("Update")) n = m_graph->addNode<UpdateNode>(allocator);
@@ -1457,6 +1676,7 @@ Node* Graph::createNode(Node::Type type) {
 		case Node::Type::SET_YAW: return addNode<SetYawNode>(m_allocator);
 		case Node::Type::CONST: return addNode<ConstNode>(m_allocator);
 		case Node::Type::MOUSE_MOVE: return addNode<MouseMoveNode>(m_allocator);
+		case Node::Type::KEY_INPUT: return addNode<KeyInputNode>(m_allocator);
 		case Node::Type::START: return addNode<StartNode>(m_allocator);
 		case Node::Type::UPDATE: return addNode<UpdateNode>(m_allocator);
 		case Node::Type::VEC3: return addNode<Vec3Node>(m_allocator);
