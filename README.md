@@ -6,5 +6,7 @@
 [![Twitter](https://img.shields.io/twitter/url/http/shields.io.svg?style=social)](https://twitter.com/mikulasflorek)
 
 Work in progress, very early stage
+Using [WASM3](https://github.com/wasm3/wasm3) as runtime.
 
 ![Screenshot](https://user-images.githubusercontent.com/153526/204159230-75e10b12-c2e5-4339-a592-1630bfe789b6.png)
+
