@@ -33,7 +33,20 @@ struct Variable {
 
 struct Graph;
 
-enum class WASMExportType : u8 {
+enum class WASMLumixAPI : u32 {
+	SET_YAW,
+	SET_PROPERTY_FLOAT,
+
+	COUNT
+};
+
+enum class WASMGlobals : u32 {
+	SELF,
+
+	USER
+};
+
+enum class WASMExternalType : u8 {
 	FUNCTION = 0,
 	TABLE = 1,
 	MEMORY = 2,
@@ -49,10 +62,12 @@ enum class WASMType : u8 {
 
 enum class WasmOp : u8 {
 	END = 0x0B,
+	CALL = 0x10,
 	LOCAL_GET = 0x20,
 	GLOBAL_GET = 0x23,
 	GLOBAL_SET = 0x24,
 	I32_CONST = 0x41,
+	I64_CONST = 0x42,
 	F32_CONST = 0x43,
 	I32_ADD = 0x6A,
 	I32_MUL = 0x6C,
@@ -173,7 +188,8 @@ protected:
 	String m_error;
 };
 
-static void writeLEB128(OutputMemoryStream& blob, u32 val) {
+template <typename T>
+static void writeLEB128(OutputMemoryStream& blob, T val) {
 	do {
 		u8 byte = val & 0x7f;
 		val >>= 7;
@@ -216,50 +232,19 @@ struct Graph {
 		return res;
 	}
 
-	void generateExports(OutputMemoryStream& blob) const {
-		writeLEB128(blob, m_variables.size() + 1); // num exports
-		writeLEB128(blob, 6); // string length
-		blob.write("update", 6);
-		blob.write(WASMExportType::FUNCTION);	// type
-		blob.write(u8(0));	// export index
-		
-		for (const Variable& var : m_variables) {
-			writeLEB128(blob, var.name.length());
-			blob.write(var.name.c_str(), var.name.length());
-			blob.write(WASMExportType::GLOBAL); // type
-			const u32 idx = u32(&var - m_variables.begin());
-			writeLEB128(blob, idx); // globla idx
-		}
+	static void writeString(OutputMemoryStream& blob, const char* value) {
+		const i32 len = stringLength(value);
+		writeLEB128(blob, len);
+		blob.write(value, len);
 	}
 
-	void generateGlobals(OutputMemoryStream& blob) const {
-		writeLEB128(blob, m_variables.size()); // num globals
-		for (const Variable& var : m_variables) {
-			switch (var.type) {
-				case ScriptValueType::U32:
-				case ScriptValueType::I32:
-					blob.write(WASMType::I32);
-					break;
-				case ScriptValueType::FLOAT:
-					blob.write(WASMType::F32);
-					break;
-				default: ASSERT(false); break;
-			}
-			blob.write(u8(1)); // mutable
-			switch (var.type) {
-				case ScriptValueType::U32:
-				case ScriptValueType::I32:
-					blob.write(WasmOp::I32_CONST);
-					blob.write(u8(0));
-					break;
-				case ScriptValueType::FLOAT:
-					blob.write(WasmOp::F32_CONST);
-					blob.write(0.f);
-					break;
-				default: ASSERT(false); break;
-			}
-		}
-		blob.write(WasmOp::END);
+	template <typename F>
+	void writeSection(OutputMemoryStream& blob, Section section, F f) const {
+		OutputMemoryStream tmp(m_allocator);
+		f(tmp);
+		blob.write(section);
+		writeLEB128(blob, (u32)tmp.size());
+		blob.write(tmp.data(), tmp.size());
 	}
 
 	void generate(OutputMemoryStream& blob) {
@@ -272,44 +257,120 @@ struct Graph {
 		blob.write(u32(0x6d736100));
 		blob.write(u32(1));
 
-		blob.write(Section::TYPE);
-		blob.write(u8(5));	// num bytes
-		blob.write(u8(1));	// num funcs
-		blob.write(u8(0x60));	// func
-		blob.write(u8(1));		// num args
-		blob.write(WASMType::F32);	// f32
-		blob.write(u8(0));		// num results
+		writeSection(blob, Section::TYPE, [](OutputMemoryStream& blob){
+			blob.write(u8(3));	// num funcs
 
-		blob.write(Section::FUNCTION);
-		blob.write(u8(2));	// num bytes
-		blob.write(u8(1));	// num funcs
-		blob.write(u8(0));	// func 0 signature index
+			// update - export
+			blob.write(u8(0x60));	// func
+			blob.write(u8(1));		// num args
+			blob.write(WASMType::F32);	// arg type
+			blob.write(u8(0));		// num results
 
-		OutputMemoryStream global_blob(m_allocator);
-		generateGlobals(global_blob);
-		blob.write(Section::GLOBAL);
-		writeLEB128(blob, (u32)global_blob.size());
-		blob.write(global_blob.data(), global_blob.size());	
+			// LumixAPI.setYaw - import
+			blob.write(u8(0x60));	// func
+			blob.write(u8(2));		// num args
+			blob.write(WASMType::I32);	// arg type
+			blob.write(WASMType::F32);	// arg type
+			blob.write(u8(0));		// num results
 
-		OutputMemoryStream exports_blob(m_allocator);
-		generateExports(exports_blob);
-		blob.write(Section::EXPORT);
-		writeLEB128(blob, (u32)exports_blob.size());
-		blob.write(exports_blob.data(), exports_blob.size());	
+			// LumixAPI.setPropertyFloat - import
+			blob.write(u8(0x60));	// func
+			blob.write(u8(3));		// num args
+			blob.write(WASMType::I32);	// arg type
+			blob.write(WASMType::I64);	// arg type
+			blob.write(WASMType::F32);	// arg type
+			blob.write(u8(0));		// num results
+		});
 
-		OutputMemoryStream func_blob(m_allocator);
-		for (Node* node : m_nodes) {
-			if (node->getType() == Node::Type::UPDATE) {
-				node->generate(func_blob, *this, 0);
-				break;
+		writeSection(blob, Section::IMPORT, [](OutputMemoryStream& blob){
+			writeLEB128(blob, 2); // num imports
+
+			writeString(blob, "LumixAPI"); // module name
+			writeString(blob, "setYaw"); // field name
+			blob.write(WASMExternalType::FUNCTION); // import kind
+			writeLEB128(blob, 1); // import signature index
+
+			writeString(blob, "LumixAPI"); // module name
+			writeString(blob, "setPropertyFloat"); // field name
+			blob.write(WASMExternalType::FUNCTION); // import kind
+			writeLEB128(blob, 2); // import signature index
+		});
+
+		writeSection(blob, Section::FUNCTION, [](OutputMemoryStream& blob){
+			blob.write(u8(1));	// num funcs
+			blob.write(u8(0));	// update
+		});
+
+		writeSection(blob, Section::GLOBAL, [this](OutputMemoryStream& blob){
+			writeLEB128(blob, m_variables.size() + (u32)WASMGlobals::USER); // num globals
+			// self
+			blob.write(WASMType::I32);
+			blob.write(u8(1)); // mutable
+			blob.write(WasmOp::I32_CONST);
+			blob.write(u8(0));
+			blob.write(WasmOp::END);
+
+			// globals
+			for (const Variable& var : m_variables) {
+				switch (var.type) {
+					case ScriptValueType::U32:
+					case ScriptValueType::I32:
+						blob.write(WASMType::I32);
+						break;
+					case ScriptValueType::FLOAT:
+						blob.write(WASMType::F32);
+						break;
+					default: ASSERT(false); break;
+				}
+				blob.write(u8(1)); // mutable
+				switch (var.type) {
+					case ScriptValueType::U32:
+					case ScriptValueType::I32:
+						blob.write(WasmOp::I32_CONST);
+						blob.write(u8(0));
+						break;
+					case ScriptValueType::FLOAT:
+						blob.write(WasmOp::F32_CONST);
+						blob.write(0.f);
+						break;
+					default: ASSERT(false); break;
+				}
+				blob.write(WasmOp::END);
 			}
-		}
+		});
 
-		blob.write(Section::CODE);
-		writeLEB128(blob, (u32)func_blob.size() + 1 + sizeofLEB128((u32)func_blob.size()));
-		blob.write(u8(1));	// num funcs
-		writeLEB128(blob, (u32)func_blob.size());
-		blob.write(func_blob.data(), func_blob.size());
+		writeSection(blob, Section::EXPORT, [this](OutputMemoryStream& blob){
+			const u32 num_exports = m_variables.size() + 1/*update*/ + 1/*self*/;
+			writeLEB128(blob, num_exports);
+			
+			writeString(blob, "update");
+			blob.write(WASMExternalType::FUNCTION);	// type
+			writeLEB128(blob, u32(WASMLumixAPI::COUNT) + 0 /*function index*/);
+		
+			writeString(blob, "self");
+			blob.write(WASMExternalType::GLOBAL); // type
+			writeLEB128(blob, (u32)WASMGlobals::SELF);
+
+			for (const Variable& var : m_variables) {
+				writeString(blob, var.name.c_str());
+				blob.write(WASMExternalType::GLOBAL); // type
+				const u32 global_idx = u32(&var - m_variables.begin()) + (u32)WASMGlobals::USER;
+				writeLEB128(blob, global_idx);
+			}
+		});
+
+		writeSection(blob, Section::CODE, [this](OutputMemoryStream& blob){
+			blob.write(u8(1));	// num funcs
+			OutputMemoryStream func_blob(m_allocator);
+			for (Node* node : m_nodes) {
+				if (node->getType() == Node::Type::UPDATE) {
+					node->generate(func_blob, *this, 0);
+					break;
+				}
+			}
+			writeLEB128(blob, (u32)func_blob.size());
+			blob.write(func_blob.data(), func_blob.size());
+		});
 
 #if 0
 		kvm_u8 bytecode[4096];
@@ -638,9 +699,8 @@ struct SelfNode : Node {
 	ScriptValueType getOutputType(u32 idx, const Graph& graph) override { return ScriptValueType::ENTITY; }
 
 	void generate(OutputMemoryStream& blob, const Graph&, u32) override {
-#if 0 // TODO
-		kvm_bc_get(&blob, (kvm_i32)EnvironmentIndices::SELF);
-#endif
+		blob.write(WasmOp::GLOBAL_GET);
+		writeLEB128(blob, (u32)WASMGlobals::SELF);
 	}
 };
 
@@ -732,14 +792,12 @@ struct SetYawNode : Node {
 			return;
 		}
 		
-#if 0 // TODO
-		kvm_bc_const(&blob, (kvm_u32)ScriptSyscalls::SET_YAW);
 		o1.generate(blob, graph);
 		o2.generate(blob, graph);
-		kvm_bc_syscall(&blob, 3);
 
+		blob.write(WasmOp::CALL);
+		writeLEB128(blob, (u32)WASMLumixAPI::SET_YAW);
 		generateNext(blob, graph);
-#endif
 	}
 };
 
@@ -1026,7 +1084,7 @@ struct SetVariableNode : Node {
 		}
 		n.generate(blob, graph);
 		blob.write(WasmOp::GLOBAL_SET);
-		writeLEB128(blob, m_var);
+		writeLEB128(blob, m_var + (u32)WASMGlobals::USER);
 		generateNext(blob, graph);
 	}
 
@@ -1066,7 +1124,7 @@ struct GetVariableNode : Node {
 
 	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
 		blob.write(WasmOp::GLOBAL_GET);
-		writeLEB128(blob, m_var);
+		writeLEB128(blob, m_var + (u32)WASMGlobals::USER);
 	}
 
 	bool onGUI() override {
@@ -1141,26 +1199,32 @@ struct SetPropertyNode : Node {
 		cmp_type = reflection::getComponentType(blob.readString());
 	}
 
-
 	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
-		NodeOutput o = getInputNode(1, graph);
-		if (!o) {
-			m_error = "Missing inputs";
+		// TODO handle other types than float
+		NodeOutput o1 = getInputNode(1, graph);
+		NodeOutput o2 = getInputNode(2, graph);
+		if (!o1) {
+			m_error = "Missing entity input";
 			return;
 		}
+
+		o1.generate(blob, graph);
 		
-		float v = (float)atof(value);
+		const StableHash prop_hash = reflection::getPropertyHash(cmp_type, prop);
+		blob.write(WasmOp::I64_CONST);
+		writeLEB128(blob, prop_hash.getHashValue());
 
-#if 0 // TODO
-		kvm_bc_const(&blob, (kvm_u32)ScriptSyscalls::SET_PROPERTY);
-		kvm_bc_const64(&blob, reflection::getPropertyHash(cmp_type, prop).getHashValue());
-		kvm_bc_const(&blob, cmp_type.index);
+		if (o2.node) {
+			o2.generate(blob, graph);
+		}
+		else {
+			blob.write(WasmOp::F32_CONST);
+			const float v = (float)atof(value);
+			blob.write(v);
+		}
 
-		o.node->generate(blob, graph, o.output_idx);
-
-		kvm_bc_const_float(&blob, v);
-		kvm_bc_syscall(&blob, 6);
-#endif
+		blob.write(WasmOp::CALL);
+		writeLEB128(blob, (u32)WASMLumixAPI::SET_PROPERTY_FLOAT);
 		generateNext(blob, graph);
 	}
 

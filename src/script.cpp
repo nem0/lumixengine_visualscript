@@ -26,10 +26,6 @@ ScriptResource::ScriptResource(const Path& path, ResourceManager& resource_manag
 	, m_allocator(allocator)
 {}
 
-ScriptResource::Variable::Variable(IAllocator& allocator)
-	: name(allocator)
-{}
-
 bool ScriptResource::load(u64 size, const u8* mem) {
 	InputMemoryStream blob(mem, size);
 	Header header;
@@ -43,19 +39,22 @@ bool ScriptResource::load(u64 size, const u8* mem) {
 	return true;
 }
 
-Script::Script(IAllocator& allocator)
-{}
-
 Script::Script(Script&& script)
 {
 	m_runtime = script.m_runtime;
 	m_module = script.m_module;
 	m_resource = script.m_resource;
+	m_init_failed = script.m_init_failed;
+
 	script.m_resource = nullptr;
+	script.m_runtime = nullptr;
+	script.m_module = nullptr;
 }
 
 Script::~Script() {
 	if (m_resource) m_resource->decRefCount();
+	ASSERT(!m_runtime);
+	ASSERT(!m_module);
 }
 
 struct ScriptSceneImpl : ScriptScene {
@@ -68,6 +67,21 @@ struct ScriptSceneImpl : ScriptScene {
 		, m_mouse_move_scripts(allocator)
 		, m_key_input_scripts(allocator)
 	{}
+
+	void tryCall(EntityRef entity, const char* function_name, ...) {
+		Script& scr = m_scripts[entity];
+		va_list ap;
+		va_start(ap, function_name);
+		IM3Function fn;
+		M3Result find_res = m3_FindFunction(&fn, scr.m_runtime, function_name);
+		if (find_res == m3Err_none) {
+			m3_CallVL(fn, ap);
+		}
+		else if (find_res != m3Err_functionLookupFailed) {
+			logError(scr.m_resource->getPath(), ": ", find_res);
+		}
+		va_end(ap);
+	}
 
 	void serialize(OutputMemoryStream& blob) override {
 		blob.write(m_scripts.size());
@@ -87,7 +101,7 @@ struct ScriptSceneImpl : ScriptScene {
 			blob.read(e);
 			e = entity_map.get(e);
 			const char* path = blob.readString();
-			Script script(m_allocator);
+			Script script;
 			script.m_resource = path[0] ? rm.load<ScriptResource>(Path(path)) : nullptr;
 			m_scripts.insert(e, static_cast<Script&&>(script));
 			m_universe.onComponentCreated(e, SCRIPT_TYPE, this);
@@ -111,25 +125,66 @@ struct ScriptSceneImpl : ScriptScene {
 
 	void onKeyEvent(const InputSystem::Event& event) {
 		for (EntityRef e : m_key_input_scripts) {
-			Script& script = m_scripts[e];
-			/*KVM vm;
-			kvm_init(&vm, (u32*)script.m_environment.getMutableData(), (u32)script.m_environment.size());
-			kvm_push(&vm, event.data.button.key_id);
-			const OutputMemoryStream& bytecode = script.m_resource->m_bytecode;
-			kvm_call(&vm, bytecode.data(), syscall, script.m_resource->m_key_input_label);*/
+			tryCall(e, "onKeyEvent", event.data.button.key_id);
 		}
 	}
 
-	void onMouseEvent(const InputSystem::Event& event) {
+	void onMouseMove(const InputSystem::Event& event) {
 		for (EntityRef e : m_mouse_move_scripts) {
-			Script& script = m_scripts[e];
-			/*KVM vm;
-			kvm_init(&vm, (u32*)script.m_environment.getMutableData(), (u32)script.m_environment.size());
-			kvm_push_float(&vm, event.data.axis.x);
-			kvm_push_float(&vm, event.data.axis.y);
-			const OutputMemoryStream& bytecode = script.m_resource->m_bytecode;
-			kvm_call(&vm, bytecode.data(), syscall, script.m_resource->m_mouse_move_label);*/
+			tryCall(e, "onMouseMove", event.data.axis.x, event.data.axis.y);
 		}
+	}
+
+	static m3ApiRawFunction(API_getPropertyFloat) {
+		m3ApiReturnType(float);
+		ScriptSceneImpl* scene = (ScriptSceneImpl*)m3_GetUserData(runtime);
+		Universe& universe = scene->getUniverse();
+		m3ApiGetArg(EntityRef, entity);
+		m3ApiGetArg(StableHash, property_hash);
+		const reflection::PropertyBase* prop = reflection::getPropertyFromHash(property_hash);
+		if (!prop) {
+			logError("Property (hash = ", property_hash.getHashValue(), ") not found");
+			return m3Err_none;
+		}
+		const reflection::Property<float>* fprop = static_cast<const reflection::Property<float>*>(prop);
+		ComponentUID cmp;
+		cmp.entity = entity;
+		cmp.scene = universe.getScene(prop->cmp->component_type);
+		ASSERT(cmp.scene);
+		const float value = fprop->get(cmp, -1);
+		ASSERT(false); // TODO check if this function is correct
+		m3ApiReturn(value);
+	}
+
+	static m3ApiRawFunction(API_setPropertyFloat) {
+		ScriptSceneImpl* scene = (ScriptSceneImpl*)m3_GetUserData(runtime);
+		Universe& universe = scene->getUniverse();
+		m3ApiGetArg(EntityRef, entity);
+		m3ApiGetArg(StableHash, property_hash);
+		m3ApiGetArg(float, value);
+		const reflection::PropertyBase* prop = reflection::getPropertyFromHash(property_hash);
+		if (!prop) {
+			logError("Property (hash = ", property_hash.getHashValue(), ") not found");
+			return m3Err_none;
+		}
+		const reflection::Property<float>* fprop = static_cast<const reflection::Property<float>*>(prop);
+		ComponentUID cmp;
+		cmp.entity = entity;
+		cmp.scene = universe.getScene(prop->cmp->component_type);
+		ASSERT(cmp.scene);
+		fprop->set(cmp, -1, value);
+		ASSERT(false); // TODO check if this function is correct
+		return m3Err_none;
+	}
+
+	static m3ApiRawFunction(API_setYaw) {
+		ScriptSceneImpl* scene = (ScriptSceneImpl*)m3_GetUserData(runtime);
+		Universe& universe = scene->getUniverse();
+		m3ApiGetArg(EntityRef, entity);
+		m3ApiGetArg(float, yaw);
+		Quat rot(Vec3(0, 1, 0), yaw);
+		universe.setRotation(entity, rot);
+		return m3Err_none;
 	}
 
 	void update(float time_delta, bool paused) override {
@@ -147,7 +202,7 @@ struct ScriptSceneImpl : ScriptScene {
 					break;
 				case InputSystem::Event::AXIS:
 					if (events[i].device->type == InputSystem::Device::MOUSE) {
-						onMouseEvent(events[i]);
+						onMouseMove(events[i]);
 					}
 					break;
 				default: break;
@@ -162,7 +217,8 @@ struct ScriptSceneImpl : ScriptScene {
 
 			bool start = false;
 			if (!script.m_runtime) {
-				script.m_runtime = m3_NewRuntime(m_environment, 32*1024, nullptr);
+				script.m_runtime = m3_NewRuntime(m_environment, 32 * 1024, this);
+				// TODO optimize - do not parse for each instance
 				const M3Result parse_res = m3_ParseModule(m_environment, &script.m_module, script.m_resource->m_bytecode.data(), (u32)script.m_resource->m_bytecode.size());
 				if (parse_res != m3Err_none) {
 					logError(script.m_resource->getPath(), ": ", parse_res);
@@ -181,28 +237,52 @@ struct ScriptSceneImpl : ScriptScene {
 					continue;
 				}
 
-#if 0
-				script.m_environment.write(iter.key());
-				script.m_environment.write(&m_universe);
-				script.m_environment.write(u32(0));
-				for (const ScriptResource::Variable& var : script.m_resource->m_variables) {
-					switch (var.type) {
-						case ScriptValueType::ENTITY:
-						case ScriptValueType::I32:
-						case ScriptValueType::U32:
-						case ScriptValueType::FLOAT:
-							script.m_environment.write(0.f);
-							break;
+				#define LINK(F) \
+					{ \
+						const M3Result link_res = m3_LinkRawFunction(script.m_module, "LumixAPI", #F, nullptr, &ScriptSceneImpl::API_##F); \
+						if (link_res != m3Err_none) { \
+							logError(script.m_resource->getPath(), ": ", link_res); \
+							script.m_init_failed = true; \
+							m3_FreeRuntime(script.m_runtime); \
+							script.m_runtime = nullptr; \
+							continue; \
+						} \
 					}
+
+				LINK(setYaw);
+				LINK(setPropertyFloat);
+				LINK(getPropertyFloat);
+
+				#undef LINK
+
+				IM3Global self_global = m3_FindGlobal(script.m_module, "self");
+				if (!self_global) {
+					logError(script.m_resource->getPath(), ": `self` not found");
+					script.m_init_failed = true;
+					m3_FreeRuntime(script.m_runtime);
+					script.m_runtime = nullptr;
+					continue;
 				}
-				start = true;
-				if (script.m_resource->m_mouse_move_label != KVM_INVALID_LABEL) {
-					m_mouse_move_scripts.push(iter.key());
+				
+				M3TaggedValue self_value;
+				self_value.type = c_m3Type_i32;
+				self_value.value.i32 = iter.key().index;
+				M3Result set_self_res = m3_SetGlobal(self_global, &self_value);
+				if (set_self_res != m3Err_none) {
+					logError(script.m_resource->getPath(), ": ", set_self_res);
+					script.m_init_failed = true;
+					m3_FreeRuntime(script.m_runtime);
+					script.m_runtime = nullptr;
+					continue;
 				}
-				if (script.m_resource->m_key_input_label != KVM_INVALID_LABEL) {
-					m_key_input_scripts.push(iter.key());
-				}
-#endif
+			}
+
+			IM3Function tmp_fn;
+			if (m3_FindFunction(&tmp_fn, script.m_runtime, "onMouseMove") == m3Err_none) {
+				m_mouse_move_scripts.push(iter.key());
+			}
+			if (m3_FindFunction(&tmp_fn, script.m_runtime, "onKeyEvent") == m3Err_none) {
+				m_key_input_scripts.push(iter.key());
 			}
 
 			IM3Function update_fn;
@@ -225,8 +305,7 @@ struct ScriptSceneImpl : ScriptScene {
 	}
 
 	void createScript(EntityRef entity) {
-		Script script(m_allocator);
-		m_scripts.insert(entity, static_cast<Script&&>(script));
+		m_scripts.insert(entity);
 		m_universe.onComponentCreated(entity, SCRIPT_TYPE, this);
 	}
 

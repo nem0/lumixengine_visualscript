@@ -12,19 +12,6 @@ enum class ScriptValueType : u32 {
 	ENTITY
 };
 
-enum class EnvironmentIndices {
-	SELF = 0,
-	UNIVERSE = 1,
-
-	VARIABLES = 3
-};
-
-enum class ScriptSyscalls : u32 {
-	SET_PROPERTY,
-	SET_YAW,
-	CALL_CMP_METHOD,
-};
-
 struct ScriptResource : Resource {
 	static ResourceType TYPE;
 
@@ -33,12 +20,6 @@ struct ScriptResource : Resource {
 
 		u32 magic = MAGIC;
 		u32 version = 0;
-	};
-
-	struct Variable {
-		Variable(IAllocator& allocator);
-		ScriptValueType type;
-		String name;
 	};
 
 	ScriptResource(const Path& path, ResourceManager& resource_manager, IAllocator& allocator);
@@ -52,7 +33,7 @@ struct ScriptResource : Resource {
 };
 
 struct Script {
-	Script(IAllocator& allocator);
+	Script() {}
 	Script(Script&& script);
 	~Script();
 
