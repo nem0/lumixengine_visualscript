@@ -7,7 +7,7 @@
 #include "engine/resource.h"
 #include "engine/resource_manager.h"
 #include "engine/stream.h"
-#include "engine/universe.h"
+#include "engine/world.h"
 #include "script.h"
 #include "../external/wasm3.h"
 
@@ -58,9 +58,9 @@ Script::~Script() {
 }
 
 struct ScriptSceneImpl : ScriptScene {
-	ScriptSceneImpl(IPlugin& plugin, Engine& engine, Universe& universe, IAllocator& allocator)
+	ScriptSceneImpl(IPlugin& plugin, Engine& engine, World& world, IAllocator& allocator)
 		: m_plugin(plugin)
-		, m_universe(universe)
+		, m_world(world)
 		, m_engine(engine)
 		, m_allocator(allocator)
 		, m_scripts(allocator)
@@ -104,12 +104,12 @@ struct ScriptSceneImpl : ScriptScene {
 			Script script;
 			script.m_resource = path[0] ? rm.load<ScriptResource>(Path(path)) : nullptr;
 			m_scripts.insert(e, static_cast<Script&&>(script));
-			m_universe.onComponentCreated(e, SCRIPT_TYPE, this);
+			m_world.onComponentCreated(e, SCRIPT_TYPE, this);
 		}
 	}
 
 	IPlugin& getPlugin() const override { return m_plugin; }
-	Universe& getUniverse() override { return m_universe; }
+	World& getWorld() override { return m_world; }
 	void clear() override {}
 
 	void stopGame() override {
@@ -136,9 +136,9 @@ struct ScriptSceneImpl : ScriptScene {
 	}
 
 	static m3ApiRawFunction(API_getPropertyFloat) {
-		m3ApiReturnType(float);
+		/*m3ApiReturnType(float);
 		ScriptSceneImpl* scene = (ScriptSceneImpl*)m3_GetUserData(runtime);
-		Universe& universe = scene->getUniverse();
+		World& world = scene->getWorld();
 		m3ApiGetArg(EntityRef, entity);
 		m3ApiGetArg(StableHash, property_hash);
 		const reflection::PropertyBase* prop = reflection::getPropertyFromHash(property_hash);
@@ -149,16 +149,18 @@ struct ScriptSceneImpl : ScriptScene {
 		const reflection::Property<float>* fprop = static_cast<const reflection::Property<float>*>(prop);
 		ComponentUID cmp;
 		cmp.entity = entity;
-		cmp.scene = universe.getScene(prop->cmp->component_type);
+		cmp.scene = world.getScene(prop->cmp->component_type);
 		ASSERT(cmp.scene);
-		const float value = fprop->get(cmp, -1);
+		const float value = fprop->get(cmp, -1);*/
+		//m3ApiReturn(value);
 		ASSERT(false); // TODO check if this function is correct
-		m3ApiReturn(value);
+		return m3Err_none;
+
 	}
 
 	static m3ApiRawFunction(API_setPropertyFloat) {
-		ScriptSceneImpl* scene = (ScriptSceneImpl*)m3_GetUserData(runtime);
-		Universe& universe = scene->getUniverse();
+		/*ScriptSceneImpl* scene = (ScriptSceneImpl*)m3_GetUserData(runtime);
+		World& world = scene->getWorld();
 		m3ApiGetArg(EntityRef, entity);
 		m3ApiGetArg(StableHash, property_hash);
 		m3ApiGetArg(float, value);
@@ -170,20 +172,20 @@ struct ScriptSceneImpl : ScriptScene {
 		const reflection::Property<float>* fprop = static_cast<const reflection::Property<float>*>(prop);
 		ComponentUID cmp;
 		cmp.entity = entity;
-		cmp.scene = universe.getScene(prop->cmp->component_type);
+		cmp.scene = world.getScene(prop->cmp->component_type);
 		ASSERT(cmp.scene);
-		fprop->set(cmp, -1, value);
+		fprop->set(cmp, -1, value);*/
 		ASSERT(false); // TODO check if this function is correct
 		return m3Err_none;
 	}
 
 	static m3ApiRawFunction(API_setYaw) {
 		ScriptSceneImpl* scene = (ScriptSceneImpl*)m3_GetUserData(runtime);
-		Universe& universe = scene->getUniverse();
+		World& world = scene->getWorld();
 		m3ApiGetArg(EntityRef, entity);
 		m3ApiGetArg(float, yaw);
 		Quat rot(Vec3(0, 1, 0), yaw);
-		universe.setRotation(entity, rot);
+		world.setRotation(entity, rot);
 		return m3Err_none;
 	}
 
@@ -301,12 +303,12 @@ struct ScriptSceneImpl : ScriptScene {
 		m_mouse_move_scripts.eraseItem(entity);
 		m_key_input_scripts.eraseItem(entity);
 		m_scripts.erase(entity);
-		m_universe.onComponentDestroyed(entity, SCRIPT_TYPE, this);
+		m_world.onComponentDestroyed(entity, SCRIPT_TYPE, this);
 	}
 
 	void createScript(EntityRef entity) {
 		m_scripts.insert(entity);
-		m_universe.onComponentCreated(entity, SCRIPT_TYPE, this);
+		m_world.onComponentCreated(entity, SCRIPT_TYPE, this);
 	}
 
 	Script& getScript(EntityRef entity) override {
@@ -332,7 +334,7 @@ struct ScriptSceneImpl : ScriptScene {
 	IAllocator& m_allocator;
 	Engine& m_engine;
 	IPlugin& m_plugin;
-	Universe& m_universe;
+	World& m_world;
 	HashMap<EntityRef, Script> m_scripts;
 	Array<EntityRef> m_mouse_move_scripts;
 	Array<EntityRef> m_key_input_scripts;
@@ -375,9 +377,9 @@ struct VisualScriptPlugin : IPlugin {
 	void serialize(OutputMemoryStream& serializer) const override {}
 	bool deserialize(u32 version, InputMemoryStream& serializer) override { return true; }
 
-	void createScenes(Universe& universe) override {
-		UniquePtr<ScriptScene> scene = UniquePtr<ScriptSceneImpl>::create(m_allocator, *this, m_engine, universe, m_allocator);
-		universe.addScene(scene.move());
+	void createScenes(World& world) override {
+		UniquePtr<ScriptScene> scene = UniquePtr<ScriptSceneImpl>::create(m_allocator, *this, m_engine, world, m_allocator);
+		world.addScene(scene.move());
 	}
 
 	IAllocator& m_allocator;

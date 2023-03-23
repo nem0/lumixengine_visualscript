@@ -13,7 +13,7 @@
 #include "engine/os.h"
 #include "engine/reflection.h"
 #include "engine/stream.h"
-#include "engine/universe.h"
+#include "engine/world.h"
 #include "../script.h"
 #include "../m3_lumix.h"
 
@@ -1251,8 +1251,8 @@ struct VisualScriptPropertyGridPlugin : PropertyGrid::IPlugin {
 		if (cmp_type != SCRIPT_TYPE) return;
 		if (entities.length() != 1) return;
 
-		Universe* universe = editor.getUniverse();
-		ScriptScene* scene = (ScriptScene*)universe->getScene(SCRIPT_TYPE);
+		World* world = editor.getWorld();
+		ScriptScene* scene = (ScriptScene*)world->getScene(SCRIPT_TYPE);
 		Script& script = scene->getScript(entities[0]);
 		
 		if (!script.m_resource) return;
