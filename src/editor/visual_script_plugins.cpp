@@ -988,6 +988,12 @@ struct MulNode : Node {
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
 
+	ScriptValueType getOutputType(u32 idx, const Graph& graph) override{ 
+		NodeOutput n0 = getInputNode(0, graph);
+		if (!n0) return ScriptValueType::U32;
+		return n0.node->getOutputType(n0.output_idx, graph);
+	}
+
 	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
 		NodeOutput n0 = getInputNode(0, graph);
 		NodeOutput n1 = getInputNode(1, graph);
@@ -1033,7 +1039,6 @@ struct AddNode : Node {
 		if (n0) return n0.node->getOutputType(n0.output_idx, graph);
 		return ScriptValueType::U32;
 	}
-
 
 	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
 		NodeOutput n0 = getInputNode(0, graph);

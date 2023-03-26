@@ -244,7 +244,7 @@ struct ScriptSceneImpl : ScriptScene {
 				#define LINK(F) \
 					{ \
 						const M3Result link_res = m3_LinkRawFunction(script.m_module, "LumixAPI", #F, nullptr, &ScriptSceneImpl::API_##F); \
-						if (link_res != m3Err_none) { \
+						if (link_res != m3Err_none && link_res != m3Err_functionLookupFailed) { \
 							logError(script.m_resource->getPath(), ": " #F ": ", link_res); \
 							script.m_init_failed = true; \
 							m3_FreeRuntime(script.m_runtime); \
