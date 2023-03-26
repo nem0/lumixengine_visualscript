@@ -1351,7 +1351,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 	VisualScriptEditorPlugin (StudioApp& app) 
 		: NodeEditor(app.getAllocator())	
 		, m_app(app)
-		, m_recent_paths(app.getAllocator())
+		, m_recent_paths("visual_script_editor_recent_", 10, app)
 		, m_asset_plugin(app)
 	{
 		m_toggle_ui.init("Visual Script Editor", "Toggle visual script editor", "visualScriptEditor", "", true);
@@ -1473,25 +1473,13 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 		Settings& settings = m_app.getSettings();
 		
 		m_is_open = settings.getValue(Settings::GLOBAL, "is_visualscript_editor_open", false);
-		m_recent_paths.clear();
-		char tmp[LUMIX_MAX_PATH];
-		for (u32 i = 0; ; ++i) {
-			const StaticString<32> key("visual_script_editor_recent_", i);
-			const u32 len = settings.getValue(Settings::LOCAL, key, Span(tmp));
-			if (len == 0) break;
-			m_recent_paths.emplace(tmp, m_app.getAllocator());
-		}
+		m_recent_paths.onSettingsLoaded();
 	}
 
 	void onBeforeSettingsSaved() override {
 		Settings& settings = m_app.getSettings();
 		settings.setValue(Settings::GLOBAL, "is_visualscript_editor_open", m_is_open);
-				
-		for (const String& p : m_recent_paths) {
-			const u32 i = u32(&p - m_recent_paths.begin());
-			const StaticString<32> key("visual_script_editor_recent_", i);
-			settings.setValue(Settings::LOCAL, key, p.c_str());
-		}
+		m_recent_paths.onBeforeSettingsSaved();
 	}
 
 	void save() {
@@ -1516,9 +1504,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 
 	void setPath(const char* path) {
 		m_path = path;
-		String p(path, m_app.getAllocator());
-		m_recent_paths.eraseItems([&](const String& s) { return s == path; });
-		m_recent_paths.push(static_cast<String&&>(p));
+		m_recent_paths.push(m_path.c_str());
 	}
 
 	void load(const char* path) {
@@ -1557,12 +1543,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 				if (ImGui::MenuItem("Open")) m_show_open = true;
 				menuItem(m_save_action, true);
 				if (ImGui::MenuItem("Save as")) m_show_save_as = true;
-				if (ImGui::BeginMenu("Recent", !m_recent_paths.empty())) {
-					for (const String& s : m_recent_paths) {
-						if (ImGui::MenuItem(s.c_str())) load(s.c_str());
-					}
-					ImGui::EndMenu();
-				}
+				if (const char* path = m_recent_paths.menu(); path) { load(path); }
 				ImGui::EndMenu();
 			}
 			if (ImGui::BeginMenu("Edit")) {
@@ -1727,7 +1708,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 	Action m_undo_action;
 	Action m_redo_action;
 	Action m_delete_action;
-	Array<String> m_recent_paths;
+	RecentPaths m_recent_paths;
 	bool m_show_save_as = false;
 	bool m_show_open = false;
 	bool m_has_focus = false;
