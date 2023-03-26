@@ -227,6 +227,7 @@ struct ScriptSceneImpl : ScriptScene {
 					// TODO reset m_init_failed if resource is reloaded
 					script.m_init_failed = true;
 					m3_FreeRuntime(script.m_runtime);
+					script.m_module = nullptr;
 					script.m_runtime = nullptr;
 					continue;
 				}
@@ -235,6 +236,7 @@ struct ScriptSceneImpl : ScriptScene {
 					logError(script.m_resource->getPath(), ": ", load_res);
 					script.m_init_failed = true;
 					m3_FreeRuntime(script.m_runtime);
+					script.m_module = nullptr;
 					script.m_runtime = nullptr;
 					continue;
 				}
@@ -243,9 +245,10 @@ struct ScriptSceneImpl : ScriptScene {
 					{ \
 						const M3Result link_res = m3_LinkRawFunction(script.m_module, "LumixAPI", #F, nullptr, &ScriptSceneImpl::API_##F); \
 						if (link_res != m3Err_none) { \
-							logError(script.m_resource->getPath(), ": ", link_res); \
+							logError(script.m_resource->getPath(), ": " #F ": ", link_res); \
 							script.m_init_failed = true; \
 							m3_FreeRuntime(script.m_runtime); \
+							script.m_module = nullptr; \
 							script.m_runtime = nullptr; \
 							continue; \
 						} \
@@ -262,6 +265,7 @@ struct ScriptSceneImpl : ScriptScene {
 					logError(script.m_resource->getPath(), ": `self` not found");
 					script.m_init_failed = true;
 					m3_FreeRuntime(script.m_runtime);
+					script.m_module = nullptr;
 					script.m_runtime = nullptr;
 					continue;
 				}
@@ -274,6 +278,7 @@ struct ScriptSceneImpl : ScriptScene {
 					logError(script.m_resource->getPath(), ": ", set_self_res);
 					script.m_init_failed = true;
 					m3_FreeRuntime(script.m_runtime);
+					script.m_module = nullptr;
 					script.m_runtime = nullptr;
 					continue;
 				}
