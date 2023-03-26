@@ -188,15 +188,19 @@ protected:
 	String m_error;
 };
 
-template <typename T>
-static void writeLEB128(OutputMemoryStream& blob, T val) {
-	do {
-		u8 byte = val & 0x7f;
-		val >>= 7;
-		if (val != 0) byte |= 0x80;
-		blob.write(byte);
-	} while (val != 0);
+// TODO check if negative numbers are correctly handled
+static void writeLEB128(OutputMemoryStream& blob, u64 val) {
+  bool end;
+  do {
+	u8 byte = val & 0x7f;
+	val >>= 7;
+	end = ((val == 0 ) && ((byte & 0x40) == 0))
+		|| ((val == -1) && ((byte & 0x40) != 0));
+	if (!end) byte |= 0x80;
+	blob.write(byte);
+  } while (!end);
 }
+
 
 struct Graph {
 	Graph(IAllocator& allocator)
