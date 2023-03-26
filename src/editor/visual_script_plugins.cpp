@@ -264,7 +264,7 @@ struct Graph {
 		blob.write(u32(1));
 
 		writeSection(blob, Section::TYPE, [](OutputMemoryStream& blob){
-			blob.write(u8(3));	// num funcs
+			blob.write(u8(4));	// num funcs
 
 			// update - export
 			blob.write(u8(0x60));	// func
@@ -286,6 +286,13 @@ struct Graph {
 			blob.write(WASMType::I64);	// arg type
 			blob.write(WASMType::F32);	// arg type
 			blob.write(u8(0));		// num results
+
+			// onMouseMove - export
+			blob.write(u8(0x60));	// func
+			blob.write(u8(2));		// num args
+			blob.write(WASMType::F32);	// arg type
+			blob.write(WASMType::F32);	// arg type
+			blob.write(u8(0));		// num results
 		});
 
 		writeSection(blob, Section::IMPORT, [](OutputMemoryStream& blob){
@@ -303,8 +310,9 @@ struct Graph {
 		});
 
 		writeSection(blob, Section::FUNCTION, [](OutputMemoryStream& blob){
-			blob.write(u8(1));	// num funcs
+			blob.write(u8(2));	// num funcs
 			blob.write(u8(0));	// update
+			blob.write(u8(3));	// onMouseMove
 		});
 
 		writeSection(blob, Section::GLOBAL, [this](OutputMemoryStream& blob){
@@ -346,12 +354,16 @@ struct Graph {
 		});
 
 		writeSection(blob, Section::EXPORT, [this](OutputMemoryStream& blob){
-			const u32 num_exports = m_variables.size() + 1/*update*/ + 1/*self*/;
+			const u32 num_exports = m_variables.size() + 2/*update & onMouseMove*/ + 1/*self*/;
 			writeLEB128(blob, num_exports);
 			
 			writeString(blob, "update");
 			blob.write(WASMExternalType::FUNCTION);	// type
 			writeLEB128(blob, u32(WASMLumixAPI::COUNT) + 0 /*function index*/);
+
+			writeString(blob, "onMouseMove");
+			blob.write(WASMExternalType::FUNCTION);	// type
+			writeLEB128(blob, u32(WASMLumixAPI::COUNT) + 1 /*function index*/);
 		
 			writeString(blob, "self");
 			blob.write(WASMExternalType::GLOBAL); // type
@@ -366,63 +378,23 @@ struct Graph {
 		});
 
 		writeSection(blob, Section::CODE, [this](OutputMemoryStream& blob){
-			blob.write(u8(1));	// num funcs
+			blob.write(u8(2));	// num funcs
 			OutputMemoryStream func_blob(m_allocator);
-			for (Node* node : m_nodes) {
-				if (node->getType() == Node::Type::UPDATE) {
-					node->generate(func_blob, *this, 0);
-					break;
+			auto gen_f = [&](Node::Type type){
+				func_blob.clear();
+				for (Node* node : m_nodes) {
+					if (node->getType() == type) {
+						node->generate(func_blob, *this, 0);
+						break;
+					}
 				}
-			}
-			writeLEB128(blob, (u32)func_blob.size());
-			blob.write(func_blob.data(), func_blob.size());
-		});
+				writeLEB128(blob, (u32)func_blob.size());
+				blob.write(func_blob.data(), func_blob.size());
+			};
 
-#if 0
-		kvm_u8 bytecode[4096];
-		kvm_bc_blob blob;
-		kvm_bc_start_write(&blob, bytecode, sizeof(bytecode));
-		kvm_label update_label = kvm_bc_create_label(&blob);
-		kvm_label start_label = kvm_bc_create_label(&blob);
-		kvm_label mouse_move_label = kvm_bc_create_label(&blob);
-		kvm_label key_input_label = kvm_bc_create_label(&blob);
-		for (Node* node : m_nodes) {
-			switch (node->getType()) {
-				case Node::Type::KEY_INPUT:
-					kvm_bc_place_label(&blob, key_input_label);
-					node->generate(blob, *this, 0);
-					break;
-				case Node::Type::MOUSE_MOVE:
-					kvm_bc_place_label(&blob, mouse_move_label);
-					node->generate(blob, *this, 0);
-					break;
-				case Node::Type::START:
-					kvm_bc_place_label(&blob, start_label);
-					node->generate(blob, *this, 0);
-					break;
-				case Node::Type::UPDATE:
-					kvm_bc_place_label(&blob, update_label);
-					node->generate(blob, *this, 0);
-					break;
-				default: break;
-			}
-		}
-		kvm_bc_end(&blob);
-		kvm_bc_end_write(&blob);
-		
-		blob.write(blob.labels[update_label]);
-		blob.write(blob.labels[start_label]);
-		blob.write(blob.labels[mouse_move_label]);
-		blob.write(blob.labels[key_input_label]);
-		blob.write(m_variables.size());
-		for (const Variable& v : m_variables) {
-			blob.writeString(v.name.c_str());
-			blob.write(v.type);
-		}
-		const u32 bytecode_size = u32(blob.ip - bytecode);
-		blob.write(bytecode_size);
-		blob.write(bytecode, blob.ip - bytecode);
-#endif
+			gen_f(Node::Type::UPDATE);
+			gen_f(Node::Type::MOUSE_MOVE);
+		});
 	}
 
 	bool deserialize(InputMemoryStream& blob) {
@@ -870,20 +842,25 @@ struct MouseMoveNode : Node {
 	
 	
 	void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {
-#if 0 // TODO
 		switch (output_idx) {
 			case 0: {
+				blob.write(u8(0)); // num locals
 				NodeInput o = getOutputNode(0, graph);
 				if(o.node) o.node->generate(blob, graph, o.input_idx);
-				kvm_bc_end(&blob);
-				break;
+				blob.write(WasmOp::END);
 			}
 			case 1:
+				blob.write(WasmOp::LOCAL_GET);
+				blob.write(u8(0));
+				break;
 			case 2:
-				kvm_bc_get_local(&blob, output_idx - 1);	
+				blob.write(WasmOp::LOCAL_GET);
+				blob.write(u8(1));
+				break;
+			default:
+				ASSERT(false);
 				break;
 		}
-#endif
 	}
 };
 

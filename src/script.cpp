@@ -3,6 +3,7 @@
 #include "engine/input_system.h"
 #include "engine/log.h"
 #include "engine/plugin.h"
+#include "engine/profiler.h"
 #include "engine/reflection.h"
 #include "engine/resource.h"
 #include "engine/resource_manager.h"
@@ -75,6 +76,7 @@ struct ScriptSceneImpl : ScriptScene {
 		IM3Function fn;
 		M3Result find_res = m3_FindFunction(&fn, scr.m_runtime, function_name);
 		if (find_res == m3Err_none) {
+			PROFILE_BLOCK("tryCall");
 			m3_CallVL(fn, ap);
 		}
 		else if (find_res != m3Err_functionLookupFailed) {
@@ -190,6 +192,7 @@ struct ScriptSceneImpl : ScriptScene {
 	}
 
 	void update(float time_delta, bool paused) override {
+		PROFILE_FUNCTION();
 		if (paused) return;
 		if (!m_is_game_running) return;
 		
@@ -282,14 +285,14 @@ struct ScriptSceneImpl : ScriptScene {
 					script.m_runtime = nullptr;
 					continue;
 				}
-			}
 
-			IM3Function tmp_fn;
-			if (m3_FindFunction(&tmp_fn, script.m_runtime, "onMouseMove") == m3Err_none) {
-				m_mouse_move_scripts.push(iter.key());
-			}
-			if (m3_FindFunction(&tmp_fn, script.m_runtime, "onKeyEvent") == m3Err_none) {
-				m_key_input_scripts.push(iter.key());
+				IM3Function tmp_fn;
+				if (m3_FindFunction(&tmp_fn, script.m_runtime, "onMouseMove") == m3Err_none) {
+					m_mouse_move_scripts.push(iter.key());
+				}
+				if (m3_FindFunction(&tmp_fn, script.m_runtime, "onKeyEvent") == m3Err_none) {
+					m_key_input_scripts.push(iter.key());
+				}
 			}
 
 			IM3Function update_fn;
