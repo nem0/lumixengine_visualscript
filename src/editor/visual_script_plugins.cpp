@@ -206,6 +206,12 @@ struct Graph {
 		, m_variables(allocator)
 	{}
 
+	~Graph() {
+		for (Node* n : m_nodes) {
+			LUMIX_DELETE(m_allocator, n);
+		}
+	}
+
 	static constexpr u32 MAGIC = '_LVS';
 
 	enum class Section : u8 {
