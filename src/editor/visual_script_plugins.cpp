@@ -46,6 +46,21 @@ enum class WASMGlobals : u32 {
 	USER
 };
 
+enum class WASMSection : u8 {
+	TYPE = 1,
+	IMPORT = 2,
+	FUNCTION = 3,
+	TABLE = 4,
+	MEMORY = 5,
+	GLOBAL = 6,
+	EXPORT = 7,
+	START = 8,
+	ELEMENT = 9,
+	CODE = 10,
+	DATA = 11,
+	DATA_COUNT = 12
+};
+
 enum class WASMExternalType : u8 {
 	FUNCTION = 0,
 	TABLE = 1,
@@ -69,6 +84,7 @@ enum class WasmOp : u8 {
 	I32_CONST = 0x41,
 	I64_CONST = 0x42,
 	F32_CONST = 0x43,
+	F64_CONST = 0x44,
 	I32_ADD = 0x6A,
 	I32_MUL = 0x6C,
 	F32_ADD = 0x92,
@@ -201,6 +217,184 @@ static void writeLEB128(OutputMemoryStream& blob, u64 val) {
   } while (!end);
 }
 
+struct WASMWriter {
+	using TypeHandle = u32;
+	using FunctionHandle = u32;
+
+	WASMWriter(IAllocator& allocator)
+		: m_allocator(allocator)
+		, m_exports(allocator)
+		, m_imports(allocator)
+		, m_globals(allocator)
+	{}
+
+	void addFunctionImport(const char* module_name, const char* field_name, Span<const WASMType> args) {
+		Import& import = m_imports.emplace(m_allocator);
+		import.module_name = module_name;
+		import.field_name = field_name;
+		ASSERT(args.length() <= lengthOf(import.args));
+		if (args.length() > 0) memcpy(import.args, args.begin(), args.length() * sizeof(args[0]));
+		import.num_args = args.length();
+	}
+
+	void addFunctionExport(const char* name, Node* node, Span<const WASMType> args) {
+		Export& e = m_exports.emplace(m_allocator);
+		e.node = node;
+		e.name = name;
+		ASSERT(args.length() <= lengthOf(e.args));
+		if (args.length() > 0) memcpy(e.args, args.begin(), args.length() * sizeof(args[0]));
+		e.num_args = args.length();
+	}
+	
+	void addGlobal(WASMType type, const char* export_name) {
+		Global& global = m_globals.emplace(m_allocator);
+		global.type = type;
+		if (export_name) global.export_name = export_name;
+	}
+
+	void write(OutputMemoryStream& blob, Graph& graph) {
+		blob.write(u32(0x6d736100));
+		blob.write(u32(1));
+	
+		writeSection(blob, WASMSection::TYPE, [this](OutputMemoryStream& blob){
+			writeLEB128(blob, m_imports.size() + m_exports.size());
+
+			for (const Import& import : m_imports) {
+				blob.write(u8(0x60)); // function
+				blob.write(u8(import.num_args));
+				for (u32 i = 0; i < import.num_args; ++i) {
+					blob.write(import.args[i]);
+				}
+				blob.write(u8(0)); // num results
+			}
+
+			for (const Export& e : m_exports) {
+				blob.write(u8(0x60)); // function
+				blob.write(u8(e.num_args));
+				for (u32 i = 0; i < e.num_args; ++i) {
+					blob.write(e.args[i]);
+				}
+				blob.write(u8(0)); // num results
+			}
+		});
+
+		writeSection(blob, WASMSection::IMPORT, [this](OutputMemoryStream& blob){
+			writeLEB128(blob, m_imports.size());
+
+			for (const Import& import : m_imports) {
+				writeString(blob, import.module_name.c_str());
+				writeString(blob, import.field_name.c_str());
+				blob.write(WASMExternalType::FUNCTION);
+				writeLEB128(blob, &import - m_imports.begin());
+			}
+		});
+
+		writeSection(blob, WASMSection::FUNCTION, [this](OutputMemoryStream& blob){
+			writeLEB128(blob, m_exports.size());
+			
+			for (const Export& func : m_exports) {
+				writeLEB128(blob, m_imports.size() + (&func - m_exports.begin()));
+			}
+		});
+
+		writeSection(blob, WASMSection::GLOBAL, [this](OutputMemoryStream& blob){
+			writeLEB128(blob, m_globals.size());
+			
+			for (const Global& global : m_globals) {
+				blob.write(global.type);
+				blob.write(u8(1)); // mutable
+				switch (global.type) {
+					case WASMType::I32:
+						blob.write(WasmOp::I32_CONST);
+						blob.write(u8(0));
+						break;
+					case WASMType::I64:
+						blob.write(WasmOp::I64_CONST);
+						blob.write(u8(0));
+						break;
+					case WASMType::F32:
+						blob.write(WasmOp::F32_CONST);
+						blob.write(0.f);
+						break;
+					case WASMType::F64:
+						blob.write(WasmOp::F64_CONST);
+						blob.write(0.0);
+						break;
+				}
+				blob.write(WasmOp::END);
+			}
+		});
+
+		writeSection(blob, WASMSection::EXPORT, [this](OutputMemoryStream& blob){
+			writeLEB128(blob, m_exports.size() + m_globals.size());
+
+			for (const Export& e : m_exports) {
+				writeString(blob, e.name.c_str());
+				blob.write(WASMExternalType::FUNCTION);
+				writeLEB128(blob, m_imports.size() + (&e - m_exports.begin()));
+			}
+			for (const Global& g : m_globals) {
+				writeString(blob, g.export_name.c_str());
+				blob.write(WASMExternalType::GLOBAL);
+				writeLEB128(blob, &g - m_globals.begin());
+			}
+		});
+
+		writeSection(blob, WASMSection::CODE, [this, &graph](OutputMemoryStream& blob){
+			writeLEB128(blob, m_exports.size());
+			OutputMemoryStream func_blob(m_allocator);
+			
+			for (const Export& code : m_exports) {
+				func_blob.clear();
+				code.node->generate(func_blob, graph, 0);
+				writeLEB128(blob, (u32)func_blob.size());
+				blob.write(func_blob.data(), func_blob.size());
+			}
+		});
+	}
+	
+	static void writeString(OutputMemoryStream& blob, const char* value) {
+		const i32 len = stringLength(value);
+		writeLEB128(blob, len);
+		blob.write(value, len);
+	}
+
+	template <typename F>
+	void writeSection(OutputMemoryStream& blob, WASMSection section, F f) const {
+		OutputMemoryStream tmp(m_allocator);
+		f(tmp);
+		blob.write(section);
+		writeLEB128(blob, (u32)tmp.size());
+		blob.write(tmp.data(), tmp.size());
+	}
+
+	struct Export {
+		Export(IAllocator& allocator) : name(allocator) {}
+		Node* node = nullptr;
+		String name;
+		u32 num_args = 0;
+		WASMType args[8];
+	};
+
+	struct Global {
+		Global(IAllocator& allocator) : export_name(allocator) {}
+		String export_name;
+		WASMType type;
+	};
+
+	struct Import {
+		Import(IAllocator& allocator) : module_name(allocator), field_name(allocator) {}
+		String module_name;
+		String field_name;
+		u32 num_args = 0;
+		WASMType args[8];
+	};
+
+	IAllocator& m_allocator;
+	Array<Import> m_imports;
+	Array<Global> m_globals;
+	Array<Export> m_exports;
+};
 
 struct Graph {
 	Graph(IAllocator& allocator)
@@ -217,188 +411,53 @@ struct Graph {
 	}
 
 	static constexpr u32 MAGIC = '_LVS';
-
-	enum class Section : u8 {
-		TYPE = 1,
-		IMPORT = 2,
-		FUNCTION = 3,
-		TABLE = 4,
-		MEMORY = 5,
-		GLOBAL = 6,
-		EXPORT = 7,
-		START = 8,
-		ELEMENT = 9,
-		CODE = 10,
-		DATA = 11,
-		DATA_COUNT = 12
-	};
-
-	static u32 sizeofLEB128(u32 val) {
-		u32 res = 0;
-		do {
-			++res;
-			val >>= 7;
-		} while (val != 0);
-		return res;
+	
+	template <typename... Args>
+	void addExport(WASMWriter& writer, Node::Type node_type, const char* name, Args... args) {
+		for (Node* n : m_nodes) {
+			if (n->getType() == node_type) {
+				WASMType a[] = { args... };
+				writer.addFunctionExport(name, n, Span(a, sizeof...(Args)));
+				break;
+			}
+		}
 	}
-
-	static void writeString(OutputMemoryStream& blob, const char* value) {
-		const i32 len = stringLength(value);
-		writeLEB128(blob, len);
-		blob.write(value, len);
-	}
-
-	template <typename F>
-	void writeSection(OutputMemoryStream& blob, Section section, F f) const {
-		OutputMemoryStream tmp(m_allocator);
-		f(tmp);
-		blob.write(section);
-		writeLEB128(blob, (u32)tmp.size());
-		blob.write(tmp.data(), tmp.size());
+	
+	template <typename... Args>
+	void addImport(WASMWriter& writer, const char* module_name, const char* field_name, Args... args) {
+		WASMType a[] = { args... };
+		writer.addFunctionImport(module_name, field_name, Span(a, sizeof...(Args)));
 	}
 
 	void generate(OutputMemoryStream& blob) {
 		for (Node* node : m_nodes) {
 			node->clearError();
 		}
+
+		WASMWriter writer(m_allocator);
+		addExport(writer, Node::Type::UPDATE, "update", WASMType::F32);
+		addExport(writer, Node::Type::MOUSE_MOVE, "onMouseMove", WASMType::F32, WASMType::F32);
+		
+		addImport(writer, "LumixAPI", "setYaw", WASMType::I32, WASMType::F32);
+		addImport(writer, "LumixAPI", "setPropertyFloat", WASMType::I32, WASMType::I64, WASMType::F32);
+
+		writer.addGlobal(WASMType::I32, "self");
+		for (const Variable& var : m_variables) {
+			switch (var.type) {
+				case ScriptValueType::U32:
+				case ScriptValueType::I32:
+					writer.addGlobal(WASMType::I32, var.name.c_str());
+					break;
+				case ScriptValueType::FLOAT:
+					writer.addGlobal(WASMType::F32, var.name.c_str());
+					break;
+				default: ASSERT(false); break;
+			}
+		}
+
 		ScriptResource::Header header;
 		blob.write(header);
-
-		blob.write(u32(0x6d736100));
-		blob.write(u32(1));
-
-		writeSection(blob, Section::TYPE, [](OutputMemoryStream& blob){
-			blob.write(u8(4));	// num funcs
-
-			// update - export
-			blob.write(u8(0x60));	// func
-			blob.write(u8(1));		// num args
-			blob.write(WASMType::F32);	// arg type
-			blob.write(u8(0));		// num results
-
-			// LumixAPI.setYaw - import
-			blob.write(u8(0x60));	// func
-			blob.write(u8(2));		// num args
-			blob.write(WASMType::I32);	// arg type
-			blob.write(WASMType::F32);	// arg type
-			blob.write(u8(0));		// num results
-
-			// LumixAPI.setPropertyFloat - import
-			blob.write(u8(0x60));	// func
-			blob.write(u8(3));		// num args
-			blob.write(WASMType::I32);	// arg type
-			blob.write(WASMType::I64);	// arg type
-			blob.write(WASMType::F32);	// arg type
-			blob.write(u8(0));		// num results
-
-			// onMouseMove - export
-			blob.write(u8(0x60));	// func
-			blob.write(u8(2));		// num args
-			blob.write(WASMType::F32);	// arg type
-			blob.write(WASMType::F32);	// arg type
-			blob.write(u8(0));		// num results
-		});
-
-		writeSection(blob, Section::IMPORT, [](OutputMemoryStream& blob){
-			writeLEB128(blob, 2); // num imports
-
-			writeString(blob, "LumixAPI"); // module name
-			writeString(blob, "setYaw"); // field name
-			blob.write(WASMExternalType::FUNCTION); // import kind
-			writeLEB128(blob, 1); // import signature index
-
-			writeString(blob, "LumixAPI"); // module name
-			writeString(blob, "setPropertyFloat"); // field name
-			blob.write(WASMExternalType::FUNCTION); // import kind
-			writeLEB128(blob, 2); // import signature index
-		});
-
-		writeSection(blob, Section::FUNCTION, [](OutputMemoryStream& blob){
-			blob.write(u8(2));	// num funcs
-			blob.write(u8(0));	// update
-			blob.write(u8(3));	// onMouseMove
-		});
-
-		writeSection(blob, Section::GLOBAL, [this](OutputMemoryStream& blob){
-			writeLEB128(blob, m_variables.size() + (u32)WASMGlobals::USER); // num globals
-			// self
-			blob.write(WASMType::I32);
-			blob.write(u8(1)); // mutable
-			blob.write(WasmOp::I32_CONST);
-			blob.write(u8(0));
-			blob.write(WasmOp::END);
-
-			// globals
-			for (const Variable& var : m_variables) {
-				switch (var.type) {
-					case ScriptValueType::U32:
-					case ScriptValueType::I32:
-						blob.write(WASMType::I32);
-						break;
-					case ScriptValueType::FLOAT:
-						blob.write(WASMType::F32);
-						break;
-					default: ASSERT(false); break;
-				}
-				blob.write(u8(1)); // mutable
-				switch (var.type) {
-					case ScriptValueType::U32:
-					case ScriptValueType::I32:
-						blob.write(WasmOp::I32_CONST);
-						blob.write(u8(0));
-						break;
-					case ScriptValueType::FLOAT:
-						blob.write(WasmOp::F32_CONST);
-						blob.write(0.f);
-						break;
-					default: ASSERT(false); break;
-				}
-				blob.write(WasmOp::END);
-			}
-		});
-
-		writeSection(blob, Section::EXPORT, [this](OutputMemoryStream& blob){
-			const u32 num_exports = m_variables.size() + 2/*update & onMouseMove*/ + 1/*self*/;
-			writeLEB128(blob, num_exports);
-			
-			writeString(blob, "update");
-			blob.write(WASMExternalType::FUNCTION);	// type
-			writeLEB128(blob, u32(WASMLumixAPI::COUNT) + 0 /*function index*/);
-
-			writeString(blob, "onMouseMove");
-			blob.write(WASMExternalType::FUNCTION);	// type
-			writeLEB128(blob, u32(WASMLumixAPI::COUNT) + 1 /*function index*/);
-		
-			writeString(blob, "self");
-			blob.write(WASMExternalType::GLOBAL); // type
-			writeLEB128(blob, (u32)WASMGlobals::SELF);
-
-			for (const Variable& var : m_variables) {
-				writeString(blob, var.name.c_str());
-				blob.write(WASMExternalType::GLOBAL); // type
-				const u32 global_idx = u32(&var - m_variables.begin()) + (u32)WASMGlobals::USER;
-				writeLEB128(blob, global_idx);
-			}
-		});
-
-		writeSection(blob, Section::CODE, [this](OutputMemoryStream& blob){
-			blob.write(u8(2));	// num funcs
-			OutputMemoryStream func_blob(m_allocator);
-			auto gen_f = [&](Node::Type type){
-				func_blob.clear();
-				for (Node* node : m_nodes) {
-					if (node->getType() == type) {
-						node->generate(func_blob, *this, 0);
-						break;
-					}
-				}
-				writeLEB128(blob, (u32)func_blob.size());
-				blob.write(func_blob.data(), func_blob.size());
-			};
-
-			gen_f(Node::Type::UPDATE);
-			gen_f(Node::Type::MOUSE_MOVE);
-		});
+		writer.write(blob, *this);
 	}
 
 	bool deserialize(InputMemoryStream& blob) {

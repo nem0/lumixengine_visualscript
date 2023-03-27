@@ -138,7 +138,7 @@ struct ScriptSceneImpl : ScriptScene {
 	}
 
 	static m3ApiRawFunction(API_getPropertyFloat) {
-		/*m3ApiReturnType(float);
+		m3ApiReturnType(float);
 		ScriptSceneImpl* scene = (ScriptSceneImpl*)m3_GetUserData(runtime);
 		World& world = scene->getWorld();
 		m3ApiGetArg(EntityRef, entity);
@@ -153,7 +153,7 @@ struct ScriptSceneImpl : ScriptScene {
 		cmp.entity = entity;
 		cmp.scene = world.getScene(prop->cmp->component_type);
 		ASSERT(cmp.scene);
-		const float value = fprop->get(cmp, -1);*/
+		const float value = fprop->get(cmp, -1);
 		//m3ApiReturn(value);
 		ASSERT(false); // TODO check if this function is correct
 		return m3Err_none;
@@ -174,8 +174,7 @@ struct ScriptSceneImpl : ScriptScene {
 		const reflection::Property<float>* fprop = static_cast<const reflection::Property<float>*>(prop);
 		ComponentUID cmp;
 		cmp.entity = entity;
-		ASSERT(false); // TODO check if this function is correct
-		//cmp.scene = world.getScene(prop->cmp->component_type);
+		cmp.scene = world.getScene(prop->cmp->component_type);
 		ASSERT(cmp.scene);
 		fprop->set(cmp, -1, value);
 		return m3Err_none;
