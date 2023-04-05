@@ -36,6 +36,7 @@ struct Graph;
 enum class WASMLumixAPI : u32 {
 	SET_YAW,
 	SET_PROPERTY_FLOAT,
+	GET_PROPERTY_FLOAT,
 
 	COUNT
 };
@@ -72,7 +73,9 @@ enum class WASMType : u8 {
 	F64 = 0x7C,
 	F32 = 0x7D,
 	I64 = 0x7E,
-	I32 = 0x7F
+	I32 = 0x7F,
+
+	VOID = 0xFF
 };
 
 enum class WasmOp : u8 {
@@ -115,7 +118,9 @@ struct Node : NodeEditorNode {
 		LT,
 		GTE,
 		LTE,
-		KEY_INPUT
+		KEY_INPUT,
+		GET_PROPERTY,
+		SWITCH
 	};
 
 	bool nodeGUI() override {
@@ -228,13 +233,14 @@ struct WASMWriter {
 		, m_globals(allocator)
 	{}
 
-	void addFunctionImport(const char* module_name, const char* field_name, Span<const WASMType> args) {
+	void addFunctionImport(const char* module_name, const char* field_name, WASMType ret_type, Span<const WASMType> args) {
 		Import& import = m_imports.emplace(m_allocator);
 		import.module_name = module_name;
 		import.field_name = field_name;
 		ASSERT(args.length() <= lengthOf(import.args));
 		if (args.length() > 0) memcpy(import.args, args.begin(), args.length() * sizeof(args[0]));
 		import.num_args = args.length();
+		import.ret_type = ret_type;
 	}
 
 	void addFunctionExport(const char* name, Node* node, Span<const WASMType> args) {
@@ -265,7 +271,7 @@ struct WASMWriter {
 				for (u32 i = 0; i < import.num_args; ++i) {
 					blob.write(import.args[i]);
 				}
-				blob.write(u8(0)); // num results
+				blob.write(u8(import.ret_type == WASMType::VOID ? 0 : 1)); // num results
 			}
 
 			for (const Export& e : m_exports) {
@@ -319,6 +325,9 @@ struct WASMWriter {
 					case WASMType::F64:
 						blob.write(WasmOp::F64_CONST);
 						blob.write(0.0);
+						break;
+					case WASMType::VOID:
+						ASSERT(false);
 						break;
 				}
 				blob.write(WasmOp::END);
@@ -388,6 +397,7 @@ struct WASMWriter {
 		String field_name;
 		u32 num_args = 0;
 		WASMType args[8];
+		WASMType ret_type;
 	};
 
 	IAllocator& m_allocator;
@@ -416,17 +426,17 @@ struct Graph {
 	void addExport(WASMWriter& writer, Node::Type node_type, const char* name, Args... args) {
 		for (Node* n : m_nodes) {
 			if (n->getType() == node_type) {
-				WASMType a[] = { args... };
-				writer.addFunctionExport(name, n, Span(a, sizeof...(Args)));
+				WASMType a[] = { args..., WASMType::VOID };
+				writer.addFunctionExport(name, n, Span(a, lengthOf(a) - 1));
 				break;
 			}
 		}
 	}
 	
 	template <typename... Args>
-	void addImport(WASMWriter& writer, const char* module_name, const char* field_name, Args... args) {
+	void addImport(WASMWriter& writer, const char* module_name, const char* field_name, WASMType ret_type, Args... args) {
 		WASMType a[] = { args... };
-		writer.addFunctionImport(module_name, field_name, Span(a, sizeof...(Args)));
+		writer.addFunctionImport(module_name, field_name, ret_type, Span(a, lengthOf(a)));
 	}
 
 	void generate(OutputMemoryStream& blob) {
@@ -437,9 +447,12 @@ struct Graph {
 		WASMWriter writer(m_allocator);
 		addExport(writer, Node::Type::UPDATE, "update", WASMType::F32);
 		addExport(writer, Node::Type::MOUSE_MOVE, "onMouseMove", WASMType::F32, WASMType::F32);
+		addExport(writer, Node::Type::KEY_INPUT, "onKeyEvent", WASMType::I32);
+		addExport(writer, Node::Type::START, "start");
 		
-		addImport(writer, "LumixAPI", "setYaw", WASMType::I32, WASMType::F32);
-		addImport(writer, "LumixAPI", "setPropertyFloat", WASMType::I32, WASMType::I64, WASMType::F32);
+		addImport(writer, "LumixAPI", "setYaw", WASMType::VOID, WASMType::I32, WASMType::F32);
+		addImport(writer, "LumixAPI", "setPropertyFloat", WASMType::VOID, WASMType::I32, WASMType::I64, WASMType::F32);
+		addImport(writer, "LumixAPI", "getPropertyFloat", WASMType::F32,  WASMType::I32, WASMType::I64);
 
 		writer.addGlobal(WASMType::I32, "self");
 		for (const Variable& var : m_variables) {
@@ -866,6 +879,38 @@ struct ConstNode : Node {
 	float m_value = 0;
 };
 
+struct SwitchNode : Node {
+	SwitchNode(IAllocator& allocator) : Node(allocator) {}
+	Type getType() const override { return Type::SWITCH; }
+	bool hasInputPins() const override { return true; }
+	bool hasOutputPins() const override { return true; }
+
+	void serialize(OutputMemoryStream& blob) const { blob.write(m_is_on); }
+	void deserialize(InputMemoryStream& blob) { blob.read(m_is_on); }
+
+	bool onGUI() override {
+		nodeTitle("Switch", true, false);
+		flowOutput(); ImGui::TextUnformatted("On");
+		flowOutput(); ImGui::TextUnformatted("Off");
+		return ImGui::Checkbox("Is On", &m_is_on);
+	}
+
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {
+		if (m_is_on) {
+			NodeInput n = getOutputNode(0, graph);
+			if (!n.node) return;
+			n.node->generate(blob, graph, n.input_idx);
+		}
+		else {
+			NodeInput n = getOutputNode(1, graph);
+			if (!n.node) return;
+			n.node->generate(blob, graph, n.input_idx);
+		}
+	}
+
+	bool m_is_on = true;
+};
+
 struct KeyInputNode : Node {
 	KeyInputNode(IAllocator& allocator)
 		: Node(allocator)
@@ -882,7 +927,23 @@ struct KeyInputNode : Node {
 		return false;
 	}
 
-	void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {}
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {
+		switch (output_idx) {
+			case 0: {
+				blob.write(u8(0)); // num locals
+				NodeInput o = getOutputNode(0, graph);
+				if(o.node) o.node->generate(blob, graph, o.input_idx);
+				blob.write(WasmOp::END);
+			}
+			case 1:
+				blob.write(WasmOp::LOCAL_GET);
+				blob.write(u8(0));
+				break;
+			default:
+				ASSERT(false);
+				break;
+		}
+	}
 };
 
 struct MouseMoveNode : Node {
@@ -970,6 +1031,7 @@ struct StartNode : Node {
 	StartNode(IAllocator& allocator)
 		: Node(allocator)
 	{}
+
 	Type getType() const override { return Type::START; }
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
@@ -980,11 +1042,10 @@ struct StartNode : Node {
 	}
 
 	void generate(OutputMemoryStream& blob, const Graph& graph, u32 pin_idx) override {
-#if 0 // TODO
+		blob.write(u8(0)); // num locals
 		NodeInput o = getOutputNode(0, graph);
 		if(o.node) o.node->generate(blob, graph, o.input_idx);
-		kvm_bc_end(&blob);
-#endif
+		blob.write(WasmOp::END);
 	}
 };
 
@@ -1189,54 +1250,84 @@ struct GetVariableNode : Node {
 	u32 m_var = 0;
 };
 
+struct GetPropertyNode : Node {
+	GetPropertyNode(ComponentType cmp_type, const char* property_name, IAllocator& allocator)
+		: Node(allocator)
+		, cmp_type(cmp_type)
+	{
+		copyString(prop, property_name);
+	}
+
+	GetPropertyNode(IAllocator& allocator)
+		: Node(allocator)
+	{}
+
+	ScriptValueType getOutputType(u32 idx, const Graph& graph) override { return ScriptValueType::FLOAT; }
+
+	bool hasInputPins() const override { return true; }
+	bool hasOutputPins() const override { return true; }
+	Type getType() const override { return Type::GET_PROPERTY; }
+
+	void serialize(OutputMemoryStream& blob) const override {
+		blob.writeString(prop);
+		blob.writeString(reflection::getComponent(cmp_type)->name);
+	}
+
+	void deserialize(InputMemoryStream& blob) override {
+		copyString(prop, blob.readString());
+		cmp_type = reflection::getComponentType(blob.readString());
+	}
+
+	bool onGUI() override {
+		nodeTitle("Get property", false, false);
+		
+		ImGui::BeginGroup();
+		inputPin();
+		ImGui::TextUnformatted("Entity");
+		ImGui::Text("%s.%s", reflection::getComponent(cmp_type)->name, prop);
+		ImGui::EndGroup();
+		
+		outputPin();
+		return false;
+	}
+
+	void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) override {
+		// TODO handle other types than float
+		NodeOutput o = getInputNode(0, graph);
+		if (!o) {
+			m_error = "Missing entity input";
+			return;
+		}
+
+		o.generate(blob, graph);
+		
+		const StableHash prop_hash = reflection::getPropertyHash(cmp_type, prop);
+		blob.write(WasmOp::I64_CONST);
+		writeLEB128(blob, prop_hash.getHashValue());
+
+		blob.write(WasmOp::CALL);
+		writeLEB128(blob, (u32)WASMLumixAPI::GET_PROPERTY_FLOAT);
+	}
+
+	char prop[64] = {};
+	ComponentType cmp_type = INVALID_COMPONENT_TYPE;
+};
+
 struct SetPropertyNode : Node {
+	SetPropertyNode(ComponentType cmp_type, const char* property_name, IAllocator& allocator)
+		: Node(allocator)
+		, cmp_type(cmp_type)
+	{
+		copyString(prop, property_name);
+	}
+
 	SetPropertyNode(IAllocator& allocator)
 		: Node(allocator)
-	{}	
+	{}
+
 	Type getType() const override { return Type::SET_PROPERTY; }
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
-
-	static bool propertyInput(const char* label, ComponentType* type, Span<char> property_name) {
-		bool res = false;
-		StaticString<128> preview;
-		if (*type == INVALID_COMPONENT_TYPE) preview = "Not set";
-		else {
-			preview = reflection::getComponent(*type)->name;
-			preview.add(".");
-			preview.add(property_name);
-		}
-		if (ImGui::BeginCombo(label, preview)) {
-			static char filter[32] = "";
-			ImGui::SetNextItemWidth(150);
-			ImGui::InputTextWithHint("##filter", "Filter", filter, sizeof(filter));
-			for (const reflection::RegisteredComponent& cmp : reflection::getComponents()) {
-				struct : reflection::IEmptyPropertyVisitor {
-					void visit(const reflection::Property<float>& prop) override {
-						StaticString<128> tmp(cmp_name, ".", prop.name);
-						if ((!filter[0] || stristr(tmp, filter)) && ImGui::Selectable(tmp)) {
-							selected = true;
-							copyString(property_name, prop.name);
-						}
-					}
-					const char* filter;
-					const char* cmp_name;
-					bool selected = false;
-					Span<char> property_name;
-				} visitor;
-				visitor.filter = filter;
-				visitor.property_name = property_name;
-				visitor.cmp_name = cmp.cmp->name;
-				cmp.cmp->visit(visitor);
-				if (visitor.selected) {
-					res = visitor.selected;
-					*type = cmp.cmp->component_type;
-				}
-			}
-			ImGui::EndCombo();
-		}
-		return res;
-	}
 
 	void serialize(OutputMemoryStream& blob) const override {
 		blob.writeString(prop);
@@ -1284,12 +1375,10 @@ struct SetPropertyNode : Node {
 		
 		inputPin();
 		ImGui::TextUnformatted("Entity");
-		ImGui::PushItemWidth(150);
-		bool res = propertyInput("Property", &cmp_type, Span(prop));
+		ImGui::Text("%s.%s", reflection::getComponent(cmp_type)->name, prop);
 		inputPin();
-		res = ImGui::InputText("Value", value, sizeof(value)) || res;
-		ImGui::PopItemWidth();
-		return res;
+		ImGui::SetNextItemWidth(150);
+		return ImGui::InputText("Value", value, sizeof(value));
 	}
 	
 	char prop[64] = {};
@@ -1669,6 +1758,36 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 		ImGui::End();
 	}
 
+	bool propertyList(ComponentType& cmp_type, Span<char> property_name) {
+		static char filter[32] = "";
+		ImGui::SetNextItemWidth(150);
+		ImGui::InputTextWithHint("##filter", "Filter", filter, sizeof(filter));
+		for (const reflection::RegisteredComponent& cmp : reflection::getComponents()) {
+			struct : reflection::IEmptyPropertyVisitor {
+				void visit(const reflection::Property<float>& prop) override {
+					StaticString<128> tmp(cmp_name, ".", prop.name);
+					if ((!filter[0] || stristr(tmp, filter)) && ImGui::Selectable(tmp)) {
+						selected = true;
+						copyString(property_name, prop.name);
+					}
+				}
+				const char* filter;
+				const char* cmp_name;
+				bool selected = false;
+				char property_name[256];
+			} visitor;
+			visitor.filter = filter;
+			visitor.cmp_name = cmp.cmp->name;
+			cmp.cmp->visit(visitor);
+			if (visitor.selected) {
+				cmp_type = cmp.cmp->component_type;
+				copyString(property_name, visitor.property_name);
+				return true;
+			}
+		}	
+		return false;
+	}
+	
 	void onContextMenu(ImVec2 pos) override {
 		ImVec2 cp = ImGui::GetItemRectMin();
 		IAllocator& allocator = m_graph->m_allocator;
@@ -1708,12 +1827,28 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 			if (ImGui::Selectable("Mouse move")) n = m_graph->addNode<MouseMoveNode>(allocator);
 			if (ImGui::Selectable("Key Input")) n = m_graph->addNode<KeyInputNode>(allocator);
 			if (ImGui::Selectable("Constant")) n = m_graph->addNode<ConstNode>(allocator);
-			if (ImGui::Selectable("Set property")) n = m_graph->addNode<SetPropertyNode>(allocator);
+			if (ImGui::BeginMenu("Get property")) {
+				ComponentType cmp_type;
+				char property_name[256];
+				if (propertyList(cmp_type, Span(property_name))) {
+					n = m_graph->addNode<GetPropertyNode>(cmp_type, property_name, allocator);
+				}
+				ImGui::EndMenu();
+			}
+			if (ImGui::BeginMenu("Set property")) {
+				ComponentType cmp_type;
+				char property_name[256];
+				if (propertyList(cmp_type, Span(property_name))) {
+					n = m_graph->addNode<SetPropertyNode>(cmp_type, property_name, allocator);
+				}
+				ImGui::EndMenu();
+			}
 			if (ImGui::Selectable("Update")) n = m_graph->addNode<UpdateNode>(allocator);
 			if (ImGui::Selectable("Vector 3")) n = m_graph->addNode<Vec3Node>(allocator);
 			if (ImGui::Selectable("Yaw to direction")) n = m_graph->addNode<YawToDirNode>(allocator);
 			if (ImGui::Selectable("Sequence")) n = m_graph->addNode<SequenceNode>(*m_graph);
 			if (ImGui::Selectable("Start")) n = m_graph->addNode<StartNode>(allocator);
+			if (ImGui::Selectable("Switch")) n = m_graph->addNode<SwitchNode>(allocator);
 			if (n) {
 				n->m_pos = pos;
 				pushUndo(NO_MERGE_UNDO);
@@ -1781,6 +1916,8 @@ Node* Graph::createNode(Node::Type type) {
 		case Node::Type::SET_VARIABLE: return addNode<SetVariableNode>(*this);
 		case Node::Type::SET_PROPERTY: return addNode<SetPropertyNode>(m_allocator);
 		case Node::Type::YAW_TO_DIR: return addNode<YawToDirNode>(m_allocator);
+		case Node::Type::GET_PROPERTY: return addNode<GetPropertyNode>(m_allocator);
+		case Node::Type::SWITCH: return addNode<SwitchNode>(m_allocator);
 	}
 	return nullptr;
 }

@@ -32,7 +32,7 @@ bool ScriptResource::load(u64 size, const u8* mem) {
 	Header header;
 	blob.read(header);
 	if (header.magic != Header::MAGIC) return false;
-	if (header.version > 0) return false;
+	if (header.version > Version::LAST) return false;
 
 	u32 bytecode_size = u32(blob.size() - blob.getPosition());
 	m_bytecode.resize(bytecode_size);
@@ -154,10 +154,8 @@ struct ScriptSceneImpl : ScriptScene {
 		cmp.scene = world.getScene(prop->cmp->component_type);
 		ASSERT(cmp.scene);
 		const float value = fprop->get(cmp, -1);
-		//m3ApiReturn(value);
 		ASSERT(false); // TODO check if this function is correct
-		return m3Err_none;
-
+		m3ApiReturn(value);
 	}
 
 	static m3ApiRawFunction(API_setPropertyFloat) {
@@ -190,11 +188,7 @@ struct ScriptSceneImpl : ScriptScene {
 		return m3Err_none;
 	}
 
-	void update(float time_delta, bool paused) override {
-		PROFILE_FUNCTION();
-		if (paused) return;
-		if (!m_is_game_running) return;
-		
+	void processEvents() {
 		InputSystem& input = m_engine.getInputSystem();
 		const InputSystem::Event* events = input.getEvents();
 		for (u32 i = 0, c = input.getEventsCount(); i < c; ++i) {
@@ -212,6 +206,13 @@ struct ScriptSceneImpl : ScriptScene {
 				default: break;
 			}
 		}
+	}
+
+	void update(float time_delta) override {
+		PROFILE_FUNCTION();
+		if (!m_is_game_running) return;
+
+		processEvents();
 
 		for (auto iter = m_scripts.begin(), end = m_scripts.end(); iter != end; ++iter) {
 			Script& script = iter.value();
@@ -223,23 +224,21 @@ struct ScriptSceneImpl : ScriptScene {
 			if (!script.m_runtime) {
 				script.m_runtime = m3_NewRuntime(m_environment, 32 * 1024, this);
 				// TODO optimize - do not parse for each instance
-				const M3Result parse_res = m3_ParseModule(m_environment, &script.m_module, script.m_resource->m_bytecode.data(), (u32)script.m_resource->m_bytecode.size());
-				if (parse_res != m3Err_none) {
-					logError(script.m_resource->getPath(), ": ", parse_res);
-					// TODO reset m_init_failed if resource is reloaded
+				auto onError = [&](const char* msg){
+					logError(script.m_resource->getPath(), ": ", msg);
 					script.m_init_failed = true;
 					m3_FreeRuntime(script.m_runtime);
 					script.m_module = nullptr;
 					script.m_runtime = nullptr;
+				};
+				const M3Result parse_res = m3_ParseModule(m_environment, &script.m_module, script.m_resource->m_bytecode.data(), (u32)script.m_resource->m_bytecode.size());
+				if (parse_res != m3Err_none) {
+					onError(parse_res);
 					continue;
 				}
 				const M3Result load_res = m3_LoadModule(script.m_runtime, script.m_module);
 				if (load_res != m3Err_none) {
-					logError(script.m_resource->getPath(), ": ", load_res);
-					script.m_init_failed = true;
-					m3_FreeRuntime(script.m_runtime);
-					script.m_module = nullptr;
-					script.m_runtime = nullptr;
+					onError(load_res);
 					continue;
 				}
 
@@ -247,11 +246,7 @@ struct ScriptSceneImpl : ScriptScene {
 					{ \
 						const M3Result link_res = m3_LinkRawFunction(script.m_module, "LumixAPI", #F, nullptr, &ScriptSceneImpl::API_##F); \
 						if (link_res != m3Err_none && link_res != m3Err_functionLookupFailed) { \
-							logError(script.m_resource->getPath(), ": " #F ": ", link_res); \
-							script.m_init_failed = true; \
-							m3_FreeRuntime(script.m_runtime); \
-							script.m_module = nullptr; \
-							script.m_runtime = nullptr; \
+							onError(link_res); \
 							continue; \
 						} \
 					}
@@ -264,11 +259,7 @@ struct ScriptSceneImpl : ScriptScene {
 
 				IM3Global self_global = m3_FindGlobal(script.m_module, "self");
 				if (!self_global) {
-					logError(script.m_resource->getPath(), ": `self` not found");
-					script.m_init_failed = true;
-					m3_FreeRuntime(script.m_runtime);
-					script.m_module = nullptr;
-					script.m_runtime = nullptr;
+					onError("`self` not found");
 					continue;
 				}
 				
@@ -277,11 +268,7 @@ struct ScriptSceneImpl : ScriptScene {
 				self_value.value.i32 = iter.key().index;
 				M3Result set_self_res = m3_SetGlobal(self_global, &self_value);
 				if (set_self_res != m3Err_none) {
-					logError(script.m_resource->getPath(), ": ", set_self_res);
-					script.m_init_failed = true;
-					m3_FreeRuntime(script.m_runtime);
-					script.m_module = nullptr;
-					script.m_runtime = nullptr;
+					onError(set_self_res);
 					continue;
 				}
 
@@ -291,6 +278,10 @@ struct ScriptSceneImpl : ScriptScene {
 				}
 				if (m3_FindFunction(&tmp_fn, script.m_runtime, "onKeyEvent") == m3Err_none) {
 					m_key_input_scripts.push(iter.key());
+				}
+				M3Result find_start_res = m3_FindFunction(&tmp_fn, script.m_runtime, "start");
+				if (find_start_res == m3Err_none) {
+					m3_CallV(tmp_fn);
 				}
 			}
 

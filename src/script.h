@@ -15,11 +15,16 @@ enum class ScriptValueType : u32 {
 struct ScriptResource : Resource {
 	static ResourceType TYPE;
 
+	enum class Version : u32 {
+
+		LAST
+	};
+
 	struct Header {
 		static const u32 MAGIC = '_scr';
 
 		u32 magic = MAGIC;
-		u32 version = 0;
+		Version version = Version::LAST;
 	};
 
 	ScriptResource(const Path& path, ResourceManager& resource_manager, IAllocator& allocator);
