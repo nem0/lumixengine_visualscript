@@ -79,6 +79,8 @@ enum class WASMType : u8 {
 };
 
 enum class WasmOp : u8 {
+	IF = 0x04,
+	ELSE = 0x05,
 	END = 0x0B,
 	CALL = 0x10,
 	LOCAL_GET = 0x20,
@@ -88,6 +90,21 @@ enum class WasmOp : u8 {
 	I64_CONST = 0x42,
 	F32_CONST = 0x43,
 	F64_CONST = 0x44,
+
+	I32_EQ = 0x46,
+	I32_NEQ = 0x47,
+	I32_LT_S = 0x48,
+	I32_GT_S = 0x4A,
+	I32_LE_S = 0x4C,
+	I32_GE_S = 0x4E,
+
+	F32_EQ = 0x5B,
+	F32_NEQ = 0x5C,
+	F32_LT = 0x5D,
+	F32_GT = 0x5E,
+	F32_LE = 0x5F,
+	F32_GE = 0x60,
+
 	I32_ADD = 0x6A,
 	I32_MUL = 0x6C,
 	F32_ADD = 0x92,
@@ -160,13 +177,14 @@ struct Node : NodeEditorNode {
 	virtual void generate(OutputMemoryStream& blob, const Graph& graph, u32 output_idx) = 0;
 	virtual void serialize(OutputMemoryStream& blob) const {}
 	virtual void deserialize(InputMemoryStream& blob) {}
-	virtual ScriptValueType getOutputType(u32 idx, const Graph& graph) { return ScriptValueType::U32; }
+	virtual ScriptValueType getOutputType(u32 idx, const Graph& graph) { return ScriptValueType::I32; }
 
 	bool m_selected = false;
 protected:
 	struct NodeInput {
 		Node* node;
 		u32 input_idx;
+		void generate(OutputMemoryStream& blob, const Graph& graph) { node->generate(blob, graph, input_idx); }
 	};
 
 	NodeInput getOutputNode(u32 idx, const Graph& graph);
@@ -271,7 +289,13 @@ struct WASMWriter {
 				for (u32 i = 0; i < import.num_args; ++i) {
 					blob.write(import.args[i]);
 				}
-				blob.write(u8(import.ret_type == WASMType::VOID ? 0 : 1)); // num results
+				if (import.ret_type == WASMType::VOID) {
+					blob.write(u8(0)); // num results
+				}
+				else {
+					blob.write(u8(1)); // num results
+					blob.write(import.ret_type);
+				}
 			}
 
 			for (const Export& e : m_exports) {
@@ -457,7 +481,6 @@ struct Graph {
 		writer.addGlobal(WASMType::I32, "self");
 		for (const Variable& var : m_variables) {
 			switch (var.type) {
-				case ScriptValueType::U32:
 				case ScriptValueType::I32:
 					writer.addGlobal(WASMType::I32, var.name.c_str());
 					break;
@@ -602,7 +625,7 @@ struct CompareNode : Node {
 	ScriptValueType getOutputType(u32 idx, const Graph& graph) override {
 		NodeOutput n0 = getInputNode(0, graph);
 		if (n0) return n0.node->getOutputType(n0.output_idx, graph);
-		return ScriptValueType::U32;
+		return ScriptValueType::I32;
 	}
 
 	bool onGUI() override {
@@ -622,7 +645,6 @@ struct CompareNode : Node {
 	}
 
 	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
-#if 0 // TODO
 		NodeOutput a = getInputNode(0, graph);
 		NodeOutput b = getInputNode(1, graph);
 		if (!a || !b) {
@@ -633,24 +655,36 @@ struct CompareNode : Node {
 		a.generate(blob, graph);
 		b.generate(blob, graph);
 
-		if (getOutputType(0, graph) == ScriptValueType::FLOAT) {
+		const ScriptValueType typeA = a.node->getOutputType(a.output_idx, graph);
+		const ScriptValueType typeB = b.node->getOutputType(b.output_idx, graph);
+
+		if (typeA != typeB) {
+			m_error = "Types do not match";
+			return;
+		}
+
+		if (typeA == ScriptValueType::FLOAT) {
 			switch (T) {
-				case Type::EQ: kvm_bc_eq(&blob); return;
-				case Type::NEQ: kvm_bc_neq(&blob); return;
-				case Type::LT: kvm_bc_ltf(&blob); return;
-				case Type::GT: kvm_bc_gtf(&blob); return;
+				case Type::EQ: blob.write(WasmOp::F32_EQ); break;
+				case Type::NEQ: blob.write(WasmOp::F32_NEQ); break;
+				case Type::LT: blob.write(WasmOp::F32_LT); break;
+				case Type::GT: blob.write(WasmOp::F32_GT); break;
+				case Type::GTE: blob.write(WasmOp::F32_GE); break;
+				case Type::LTE: blob.write(WasmOp::F32_LE); break;
 				default: ASSERT(false); return;
 			}
 		}
-
-		switch (T) {
-			case Type::EQ: kvm_bc_eq(&blob); break;
-			case Type::NEQ: kvm_bc_neq(&blob); break;
-			case Type::LT: kvm_bc_lt(&blob); break;
-			case Type::GT: kvm_bc_gt(&blob); break;
-			default: ASSERT(false); break;
+		else {
+			switch (T) {
+				case Type::EQ: blob.write(WasmOp::I32_EQ); break;
+				case Type::NEQ: blob.write(WasmOp::I32_NEQ); break;
+				case Type::LT: blob.write(WasmOp::I32_LT_S); break;
+				case Type::GT: blob.write(WasmOp::I32_GT_S); break;
+				case Type::GTE: blob.write(WasmOp::I32_GE_S); break;
+				case Type::LTE: blob.write(WasmOp::I32_LE_S); break;
+				default: ASSERT(false); break;
+			}
 		}
-#endif
 	}
 };
 
@@ -690,18 +724,13 @@ struct IfNode : Node {
 			return;
 		}
 		
-#if 0 // TODO
-		kvm_u32 else_label = kvm_bc_create_label(&blob);
-		kvm_u32 endif_label = kvm_bc_create_label(&blob);
-		
 		cond.generate(blob, graph);
-		kvm_bc_jmp(&blob, else_label);
-		true_branch.node->generate(blob, graph, 0);
-		kvm_bc_jmp(&blob, endif_label);
-		kvm_bc_place_label(&blob, else_label);
-		false_branch.node->generate(blob, graph, 0);
-		kvm_bc_place_label(&blob, endif_label);
-#endif
+		blob.write(WasmOp::IF);
+		blob.write(u8(0x40)); // block type
+		true_branch.generate(blob, graph);
+		blob.write(WasmOp::ELSE);
+		false_branch.generate(blob, graph);
+		blob.write(WasmOp::END);
 	}
 };
 
@@ -862,7 +891,9 @@ struct ConstNode : Node {
 	Type getType() const override { return Type::CONST; }
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
-	
+
+	ScriptValueType getOutputType(u32 idx, const Graph& graph) { return ScriptValueType::FLOAT; }
+
 	void serialize(OutputMemoryStream& blob) const { blob.write(m_value); }
 	void deserialize(InputMemoryStream& blob) { blob.read(m_value); }
 
@@ -919,7 +950,7 @@ struct KeyInputNode : Node {
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
 
-	ScriptValueType getOutputType(u32 idx, const Graph& graph) { return ScriptValueType::U32; }
+	ScriptValueType getOutputType(u32 idx, const Graph& graph) { return ScriptValueType::I32; }
 
 	bool onGUI() override {
 		nodeTitle(ICON_FA_KEY " Key input", false, true);
@@ -1091,7 +1122,7 @@ struct MulNode : Node {
 
 	ScriptValueType getOutputType(u32 idx, const Graph& graph) override{ 
 		NodeOutput n0 = getInputNode(0, graph);
-		if (!n0) return ScriptValueType::U32;
+		if (!n0) return ScriptValueType::I32;
 		return n0.node->getOutputType(n0.output_idx, graph);
 	}
 
@@ -1138,7 +1169,7 @@ struct AddNode : Node {
 	ScriptValueType getOutputType(u32 idx, const Graph& graph) override {
 		NodeOutput n0 = getInputNode(0, graph);
 		if (n0) return n0.node->getOutputType(n0.output_idx, graph);
-		return ScriptValueType::U32;
+		return ScriptValueType::I32;
 	}
 
 	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
@@ -1186,6 +1217,14 @@ struct SetVariableNode : Node {
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
 
+	void serialize(OutputMemoryStream& blob) const override {
+		blob.write(m_var);
+	}
+
+	void deserialize(InputMemoryStream& blob) override {
+		blob.read(m_var);
+	}
+
 	Type getType() const override { return Type::SET_VARIABLE; }
 
 	void generate(OutputMemoryStream& blob, const Graph& graph, u32) override {
@@ -1229,6 +1268,14 @@ struct GetVariableNode : Node {
 	Type getType() const override { return Type::GET_VARIABLE; }
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
+
+	void serialize(OutputMemoryStream& blob) const override {
+		blob.write(m_var);
+	}
+
+	void deserialize(InputMemoryStream& blob) override {
+		blob.read(m_var);
+	}
 
 	ScriptValueType getOutputType(u32 idx, const Graph& graph) override {
 		return graph.m_variables[m_var].type;

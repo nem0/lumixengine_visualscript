@@ -6,7 +6,7 @@
 namespace Lumix {
 
 enum class ScriptValueType : u32 {
-	U32,
+	U32_DEPRECATED,
 	I32,
 	FLOAT,
 	ENTITY
