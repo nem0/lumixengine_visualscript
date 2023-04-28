@@ -1439,8 +1439,8 @@ struct VisualScriptPropertyGridPlugin : PropertyGrid::IPlugin {
 		if (entities.length() != 1) return;
 
 		World* world = editor.getWorld();
-		ScriptScene* scene = (ScriptScene*)world->getScene(SCRIPT_TYPE);
-		Script& script = scene->getScript(entities[0]);
+		ScriptModule* module = (ScriptModule*)world->getModule(SCRIPT_TYPE);
+		Script& script = module->getScript(entities[0]);
 		
 		if (!script.m_resource) return;
 		if (!script.m_resource->isReady()) return;

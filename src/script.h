@@ -48,7 +48,7 @@ struct Script {
 	ScriptResource* m_resource = nullptr;
 };
 
-struct ScriptScene : IScene {
+struct ScriptModule : IModule {
 	virtual Script& getScript(EntityRef entity) = 0;
 };
 

@@ -58,9 +58,9 @@ Script::~Script() {
 	ASSERT(!m_module);
 }
 
-struct ScriptSceneImpl : ScriptScene {
-	ScriptSceneImpl(IPlugin& plugin, Engine& engine, World& world, IAllocator& allocator)
-		: m_plugin(plugin)
+struct ScriptModuleImpl : ScriptModule {
+	ScriptModuleImpl(ISystem& system, Engine& engine, World& world, IAllocator& allocator)
+		: m_system(system)
 		, m_world(world)
 		, m_engine(engine)
 		, m_allocator(allocator)
@@ -110,9 +110,8 @@ struct ScriptSceneImpl : ScriptScene {
 		}
 	}
 
-	IPlugin& getPlugin() const override { return m_plugin; }
+	ISystem& getSystem() const override { return m_system; }
 	World& getWorld() override { return m_world; }
-	void clear() override {}
 
 	void stopGame() override {
 		m_is_game_running = false;
@@ -139,8 +138,8 @@ struct ScriptSceneImpl : ScriptScene {
 
 	static m3ApiRawFunction(API_getPropertyFloat) {
 		m3ApiReturnType(float);
-		ScriptSceneImpl* scene = (ScriptSceneImpl*)m3_GetUserData(runtime);
-		World& world = scene->getWorld();
+		ScriptModuleImpl* module = (ScriptModuleImpl*)m3_GetUserData(runtime);
+		World& world = module->getWorld();
 		m3ApiGetArg(EntityRef, entity);
 		m3ApiGetArg(StableHash, property_hash);
 		const reflection::PropertyBase* prop = reflection::getPropertyFromHash(property_hash);
@@ -151,16 +150,16 @@ struct ScriptSceneImpl : ScriptScene {
 		const reflection::Property<float>* fprop = static_cast<const reflection::Property<float>*>(prop);
 		ComponentUID cmp;
 		cmp.entity = entity;
-		cmp.scene = world.getScene(prop->cmp->component_type);
-		ASSERT(cmp.scene);
+		cmp.module = world.getModule(prop->cmp->component_type);
+		ASSERT(cmp.module);
 		const float value = fprop->get(cmp, -1);
 		ASSERT(false); // TODO check if this function is correct
 		m3ApiReturn(value);
 	}
 
 	static m3ApiRawFunction(API_setPropertyFloat) {
-		ScriptSceneImpl* scene = (ScriptSceneImpl*)m3_GetUserData(runtime);
-		World& world = scene->getWorld();
+		ScriptModuleImpl* module = (ScriptModuleImpl*)m3_GetUserData(runtime);
+		World& world = module->getWorld();
 		m3ApiGetArg(EntityRef, entity);
 		m3ApiGetArg(StableHash, property_hash);
 		m3ApiGetArg(float, value);
@@ -172,15 +171,15 @@ struct ScriptSceneImpl : ScriptScene {
 		const reflection::Property<float>* fprop = static_cast<const reflection::Property<float>*>(prop);
 		ComponentUID cmp;
 		cmp.entity = entity;
-		cmp.scene = world.getScene(prop->cmp->component_type);
-		ASSERT(cmp.scene);
+		cmp.module = world.getModule(prop->cmp->component_type);
+		ASSERT(cmp.module);
 		fprop->set(cmp, -1, value);
 		return m3Err_none;
 	}
 
 	static m3ApiRawFunction(API_setYaw) {
-		ScriptSceneImpl* scene = (ScriptSceneImpl*)m3_GetUserData(runtime);
-		World& world = scene->getWorld();
+		ScriptModuleImpl* module = (ScriptModuleImpl*)m3_GetUserData(runtime);
+		World& world = module->getWorld();
 		m3ApiGetArg(EntityRef, entity);
 		m3ApiGetArg(float, yaw);
 		Quat rot(Vec3(0, 1, 0), yaw);
@@ -244,7 +243,7 @@ struct ScriptSceneImpl : ScriptScene {
 
 				#define LINK(F) \
 					{ \
-						const M3Result link_res = m3_LinkRawFunction(script.m_module, "LumixAPI", #F, nullptr, &ScriptSceneImpl::API_##F); \
+						const M3Result link_res = m3_LinkRawFunction(script.m_module, "LumixAPI", #F, nullptr, &ScriptModuleImpl::API_##F); \
 						if (link_res != m3Err_none && link_res != m3Err_functionLookupFailed) { \
 							onError(link_res); \
 							continue; \
@@ -331,7 +330,7 @@ struct ScriptSceneImpl : ScriptScene {
 
 	IAllocator& m_allocator;
 	Engine& m_engine;
-	IPlugin& m_plugin;
+	ISystem& m_system;
 	World& m_world;
 	HashMap<EntityRef, Script> m_scripts;
 	Array<EntityRef> m_mouse_move_scripts;
@@ -354,7 +353,7 @@ struct ScriptManager : ResourceManager {
 	}
 };
 
-struct VisualScriptPlugin : IPlugin {
+struct VisualScriptPlugin : ISystem {
 	VisualScriptPlugin(Engine& engine)
 		: m_engine(engine)
 		, m_allocator(engine.getAllocator())
@@ -365,19 +364,18 @@ struct VisualScriptPlugin : IPlugin {
 
 		m_script_manager.create(ScriptResource::TYPE, engine.getResourceManager());
 	
-		LUMIX_SCENE(ScriptSceneImpl, "script")
+		LUMIX_MODULE(ScriptModuleImpl, "script")
 			.LUMIX_CMP(Script, "script", "Script")
 				.LUMIX_PROP(ScriptResource, "Script").resourceAttribute(ScriptResource::TYPE);
 	}
 
 	const char* getName() const override { return "script"; }
-	u32 getVersion() const override { return 0; }
 	void serialize(OutputMemoryStream& serializer) const override {}
-	bool deserialize(u32 version, InputMemoryStream& serializer) override { return true; }
+	bool deserialize(i32 version, InputMemoryStream& serializer) override { return version == 0; }
 
-	void createScenes(World& world) override {
-		UniquePtr<ScriptScene> scene = UniquePtr<ScriptSceneImpl>::create(m_allocator, *this, m_engine, world, m_allocator);
-		world.addScene(scene.move());
+	void createModules(World& world) override {
+		UniquePtr<ScriptModule> module = UniquePtr<ScriptModuleImpl>::create(m_allocator, *this, m_engine, world, m_allocator);
+		world.addModule(module.move());
 	}
 
 	IAllocator& m_allocator;
