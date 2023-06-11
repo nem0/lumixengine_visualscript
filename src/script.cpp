@@ -69,6 +69,8 @@ struct ScriptModuleImpl : ScriptModule {
 		, m_key_input_scripts(allocator)
 	{}
 
+	const char* getName() const override { return "script"; }
+
 	void tryCall(EntityRef entity, const char* function_name, ...) {
 		Script& scr = m_scripts[entity];
 		va_list ap;
