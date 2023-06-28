@@ -12,6 +12,7 @@
 #include "engine/log.h"
 #include "engine/os.h"
 #include "engine/reflection.h"
+#include "engine/stack_array.h"
 #include "engine/stream.h"
 #include "engine/world.h"
 #include "../script.h"
@@ -1331,10 +1332,10 @@ struct GetPropertyNode : Node {
 		ImGui::BeginGroup();
 		inputPin();
 		ImGui::TextUnformatted("Entity");
+		outputPin();
 		ImGui::Text("%s.%s", reflection::getComponent(cmp_type)->name, prop);
 		ImGui::EndGroup();
 		
-		outputPin();
 		return false;
 	}
 
@@ -1598,35 +1599,178 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 		pushUndo(NO_MERGE_UNDO);
 	}
 
-	void onCanvasClicked(ImVec2 pos, i32 hovered_link) override {
-		static struct {
-			char key;
-			const char* label;
-			Node::Type type;
-		} TYPES[] = {
-			{ '1', "Const", Node::Type::CONST },
-			{ '3', "Vec3", Node::Type::VEC3 },
-			{ 'A', "Add", Node::Type::ADD },
-			{ 'C', "Call", Node::Type::MUL },
-			{ 'E', "Equal", Node::Type::EQ },
-			{ 'G', "Greater than", Node::Type::GT },
-			{ 'I', "If", Node::Type::IF },
-			{ 'L', "Less than", Node::Type::LT },
-			{ 'M', "Multiply", Node::Type::MUL },
-			{ 'N', "Not equal", Node::Type::NEQ},
-			{ 'T', "Self", Node::Type::SELF },
-			{ 'S', "Sequence", Node::Type::SEQUENCE },
-			{ 'P', "Set property", Node::Type::SET_PROPERTY },
+	struct INodeTypeVisitor {
+		struct ICreator {
+			virtual Node* create(Graph& graph) = 0;
 		};
 
-		for (const auto& t : TYPES) {
-			if (os::isKeyDown((os::Keycode)t.key)) {
-				Node* n = m_graph->createNode(t.type);
-				n->m_pos = pos;
-				if (hovered_link >= 0) splitLink(m_graph->m_nodes.back(), m_graph->m_links, hovered_link);
-				pushUndo(NO_MERGE_UNDO);
-				break;
+		virtual ~INodeTypeVisitor() {}
+		virtual bool beginCategory(const char* name) { return true; }
+		virtual void endCategory() {}
+		virtual INodeTypeVisitor& visit(const char* label, ICreator& creator, char shortcut = 0) = 0;
+		INodeTypeVisitor& visit(const char* label, Node::Type type, char shortcut = 0) {
+			struct : ICreator {
+				Node* create(Graph& graph) override { return graph.createNode(type); }
+				Node::Type type;
+			} creator;
+			creator.type = type;
+			return visit(label, creator, shortcut);
+		}
+	};
+
+	void visitTypes(INodeTypeVisitor& visitor) {
+		if (visitor.beginCategory("Compare")) {
+			visitor.visit("=", Node::Type::EQ)
+			.visit("<>", Node::Type::NEQ)
+			.visit("<", Node::Type::LT)
+			.visit(">", Node::Type::GT)
+			.visit("<=", Node::Type::LTE)
+			.visit(">=", Node::Type::GTE)
+			.endCategory();
+		}
+		
+		if (visitor.beginCategory("Set variable")) {
+			for (const Variable& var : m_graph->m_variables) {
+				struct : INodeTypeVisitor::ICreator {
+					Node* create(Graph& graph) override { return graph.addNode<SetVariableNode>(graph, idx); }
+					u32 idx;
+				} creator;
+				creator.idx = u32(&var - m_graph->m_variables.begin());
+				if (var.name.length() > 0) visitor.visit(var.name.c_str(), creator);
 			}
+			visitor.endCategory();
+		}
+
+		if (visitor.beginCategory("Get variable")) {
+			for (const Variable& var : m_graph->m_variables) {
+				struct : INodeTypeVisitor::ICreator {
+					Node* create(Graph& graph) override {
+						return graph.addNode<GetVariableNode>(graph, idx);
+					}
+					u32 idx;
+				} creator;
+				creator.idx = u32(&var - m_graph->m_variables.begin());
+				if (var.name.length() > 0) visitor.visit(var.name.c_str(), creator);
+			}
+			visitor.endCategory();
+		}
+
+		if (visitor.beginCategory("Get property")) {
+			for (const reflection::RegisteredComponent& cmp : reflection::getComponents()) {
+				if (cmp.cmp->props.empty()) continue;
+
+				if (visitor.beginCategory(cmp.cmp->name)) {
+					struct : reflection::IEmptyPropertyVisitor {
+						void visit(const reflection::Property<float>& prop) override {
+							struct : INodeTypeVisitor::ICreator {
+								Node* create(Graph& graph) override {
+									return graph.addNode<GetPropertyNode>(cmp->cmp->component_type, prop->name, graph.m_allocator);
+								}
+								const reflection::RegisteredComponent* cmp;
+								const reflection::Property<float>* prop;
+							} creator;
+							creator.cmp = cmp;
+							creator.prop = &prop;
+							type_visitor->visit(prop.name, creator);
+						}
+						const reflection::RegisteredComponent* cmp;
+						INodeTypeVisitor* type_visitor;
+					} prop_visitor;
+					prop_visitor.type_visitor = &visitor;
+					prop_visitor.cmp = &cmp;
+					cmp.cmp->visit(prop_visitor);
+					visitor.endCategory();
+				}
+			}	
+
+			visitor.endCategory();
+		}
+		
+		if (visitor.beginCategory("Set property")) {
+			for (const reflection::RegisteredComponent& cmp : reflection::getComponents()) {
+				if (cmp.cmp->props.empty()) continue;
+
+				if (visitor.beginCategory(cmp.cmp->name)) {
+					struct : reflection::IEmptyPropertyVisitor {
+						void visit(const reflection::Property<float>& prop) override {
+							struct : INodeTypeVisitor::ICreator {
+								Node* create(Graph& graph) override {
+									return graph.addNode<SetPropertyNode>(cmp->cmp->component_type, prop->name, graph.m_allocator);
+								}
+								const reflection::RegisteredComponent* cmp;
+								const reflection::Property<float>* prop;
+							} creator;
+							creator.cmp = cmp;
+							creator.prop = &prop;
+							type_visitor->visit(prop.name, creator);
+						}
+						const reflection::RegisteredComponent* cmp;
+						INodeTypeVisitor* type_visitor;
+					} prop_visitor;
+					prop_visitor.type_visitor = &visitor;
+					prop_visitor.cmp = &cmp;
+					cmp.cmp->visit(prop_visitor);
+					visitor.endCategory();
+				}
+			}	
+
+			visitor.endCategory();
+		}
+
+		if (visitor.beginCategory("Call")) {
+			for (const reflection::RegisteredComponent& rcmp : reflection::getComponents()) {
+				struct : INodeTypeVisitor::ICreator {
+					Node* create(Graph& graph) override {
+						return graph.addNode<CallNode>(cmp, f, graph.m_allocator);
+					}
+					reflection::ComponentBase* cmp;
+					reflection::FunctionBase* f;
+				} creator;
+				creator.cmp = rcmp.cmp;
+				if (!rcmp.cmp->functions.empty() && visitor.beginCategory(rcmp.cmp->name)) {
+					for (reflection::FunctionBase* f : rcmp.cmp->functions) {
+						creator.f = f;
+						visitor.visit(f->name, creator);
+					}
+					visitor.endCategory();
+				}
+			}
+			visitor.endCategory();
+		}
+
+		visitor.visit("Add", Node::Type::ADD, 'A')
+			.visit("Constant", Node::Type::CONST, '1')
+			.visit("If", Node::Type::IF, 'I')
+			.visit("Key Input", Node::Type::KEY_INPUT)
+			.visit("Mouse move", Node::Type::MOUSE_MOVE)
+			.visit("Multiply", Node::Type::MUL, 'M')
+			.visit("Self", Node::Type::SELF, 'S')
+			.visit("Sequence", Node::Type::SEQUENCE)
+			.visit("Set yaw", Node::Type::SET_YAW)
+			.visit("Start", Node::Type::START)
+			.visit("Switch", Node::Type::SWITCH)
+			.visit("Update", Node::Type::UPDATE)
+			.visit("Vector 3", Node::Type::VEC3, '3')
+			.visit("Yaw to direction", Node::Type::YAW_TO_DIR);
+	}
+
+	void onCanvasClicked(ImVec2 pos, i32 hovered_link) override {
+		struct : INodeTypeVisitor {
+			INodeTypeVisitor& visit(const char* label, ICreator& creator, char shortcut = 0) override {
+				if (shortcut && os::isKeyDown((os::Keycode)shortcut)) {
+					n = creator.create(*plugin->m_graph);
+				}
+				return *this;
+			}
+			VisualScriptEditorPlugin* plugin;
+			Node* n = nullptr;
+		} visitor;
+		visitor.plugin = this;
+		visitTypes(visitor);
+		if (visitor.n) {
+			visitor.n->m_pos = pos;
+			if (hovered_link >= 0) splitLink(m_graph->m_nodes.back(), m_graph->m_links, hovered_link);
+			pushUndo(NO_MERGE_UNDO);
 		}
 	}
 	
@@ -1776,30 +1920,6 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 			static ImVec2 offset = ImVec2(0, 0);
 			const ImVec2 editor_pos = ImGui::GetCursorScreenPos();
 			nodeEditorGUI(m_graph->m_nodes, m_graph->m_links);
-			/*ImGuiEx::BeginNodeEditor("vs", &offset);
-			
-			for (UniquePtr<Node>& node : m_graph->m_nodes) {
-				node->nodeGUI();
-				if (ImGui::IsItemHovered()) {
-					hovered_node = i32(&node - m_graph->m_nodes.begin());
-				}
-			}
-
-			for (const NodeEditorLink& link : m_graph->m_links) {
-				ImGuiEx::NodeLink(link.from, link.to);
-				if (ImGuiEx::IsLinkHovered()) {
-					hovered_link = i32(&link - m_graph->m_links.begin());
-				}
-			}
-
-			ImGuiID link_from, link_to;
-			if (ImGuiEx::GetNewLink(&link_from, &link_to)) {
-				NodeEditorLink& link = m_graph->m_links.emplace();
-				link.from = link_from;
-				link.to = link_to;
-			}
-
-			ImGuiEx::EndNodeEditor();*/
 			ImGui::Columns();
 		}
 		ImGui::End();
@@ -1836,86 +1956,65 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 	}
 	
 	void onContextMenu(ImVec2 pos) override {
-		ImVec2 cp = ImGui::GetItemRectMin();
-		IAllocator& allocator = m_graph->m_allocator;
-		if (ImGui::BeginMenu("Add node")) {
-			Node* n = nullptr;
-			if (ImGui::Selectable("Add")) n = m_graph->addNode<AddNode>(allocator);
-			if (ImGui::Selectable("Multiply")) n = m_graph->addNode<MulNode>(allocator);
-			if (ImGui::BeginMenu("Set variable")) {
-				for (const Variable& var : m_graph->m_variables) {
-					if (var.name.length() > 0 && ImGui::Selectable(var.name.c_str())) {
-						n = m_graph->addNode<SetVariableNode>(*m_graph, u32(&var - m_graph->m_variables.begin()));
-					}
-				}
-				ImGui::EndMenu();
-			}
-			if (ImGui::BeginMenu("Get variable")) {
-				for (const Variable& var : m_graph->m_variables) {
-					if (var.name.length() > 0 && ImGui::Selectable(var.name.c_str())) {
-						n = m_graph->addNode<GetVariableNode>(*m_graph, u32(&var - m_graph->m_variables.begin()));
-					}
-				}
-				ImGui::EndMenu();
-			}
-			if (ImGui::BeginMenu("Compare")) {
-				if (ImGui::Selectable("=")) n = m_graph->addNode<CompareNode<Node::Type::EQ>>(allocator);
-				if (ImGui::Selectable("<>")) n = m_graph->addNode<CompareNode<Node::Type::NEQ>>(allocator);
-				if (ImGui::Selectable("<")) n = m_graph->addNode<CompareNode<Node::Type::LT>>(allocator);
-				if (ImGui::Selectable(">")) n = m_graph->addNode<CompareNode<Node::Type::GT>>(allocator);
-				if (ImGui::Selectable("<=")) n = m_graph->addNode<CompareNode<Node::Type::GTE>>(allocator);
-				if (ImGui::Selectable(">=")) n = m_graph->addNode<CompareNode<Node::Type::LTE>>(allocator);
-				ImGui::EndMenu();
-			}
-			
-			if (ImGui::Selectable("If")) n = m_graph->addNode<IfNode>(allocator);
-			if (ImGui::Selectable("Self")) n = m_graph->addNode<SelfNode>(allocator);
-			if (ImGui::Selectable("Set yaw")) n = m_graph->addNode<SetYawNode>(allocator);
-			if (ImGui::Selectable("Mouse move")) n = m_graph->addNode<MouseMoveNode>(allocator);
-			if (ImGui::Selectable("Key Input")) n = m_graph->addNode<KeyInputNode>(allocator);
-			if (ImGui::Selectable("Constant")) n = m_graph->addNode<ConstNode>(allocator);
-			if (ImGui::BeginMenu("Get property")) {
-				ComponentType cmp_type;
-				char property_name[256];
-				if (propertyList(cmp_type, Span(property_name))) {
-					n = m_graph->addNode<GetPropertyNode>(cmp_type, property_name, allocator);
-				}
-				ImGui::EndMenu();
-			}
-			if (ImGui::BeginMenu("Set property")) {
-				ComponentType cmp_type;
-				char property_name[256];
-				if (propertyList(cmp_type, Span(property_name))) {
-					n = m_graph->addNode<SetPropertyNode>(cmp_type, property_name, allocator);
-				}
-				ImGui::EndMenu();
-			}
-			if (ImGui::Selectable("Update")) n = m_graph->addNode<UpdateNode>(allocator);
-			if (ImGui::Selectable("Vector 3")) n = m_graph->addNode<Vec3Node>(allocator);
-			if (ImGui::Selectable("Yaw to direction")) n = m_graph->addNode<YawToDirNode>(allocator);
-			if (ImGui::Selectable("Sequence")) n = m_graph->addNode<SequenceNode>(*m_graph);
-			if (ImGui::Selectable("Start")) n = m_graph->addNode<StartNode>(allocator);
-			if (ImGui::Selectable("Switch")) n = m_graph->addNode<SwitchNode>(allocator);
-			if (n) {
-				n->m_pos = pos;
-				pushUndo(NO_MERGE_UNDO);
-			}
-			ImGui::EndMenu();
-		}
+		static char filter[64] = "";
+		if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+		ImGui::SetNextItemWidth(150);
+		ImGui::InputTextWithHint("##filter", "Filter", filter, sizeof(filter), ImGuiInputTextFlags_AutoSelectAll);
 
-		if (ImGui::BeginMenu("Call")) {
-			for (const reflection::RegisteredComponent& rcmp : reflection::getComponents()) {
-				if (!rcmp.cmp->functions.empty() && ImGui::BeginMenu(rcmp.cmp->name)) {
-					for (reflection::FunctionBase* f : rcmp.cmp->functions) {
-						if (ImGui::Selectable(f->name)) {
-							m_graph->addNode<CallNode>(rcmp.cmp, f, allocator);
-							pushUndo(NO_MERGE_UNDO);
+		if (filter[0]) {
+			struct Visitor : INodeTypeVisitor {
+				Visitor(IAllocator& allocator) : path(allocator) {}
+				
+				bool beginCategory(const char* name) override {
+					path.emplace(name);
+					return true;
+				}
+
+				void endCategory() override { path.pop(); }
+				
+				INodeTypeVisitor& visit(const char* label, ICreator& creator, char shortcut) override {
+					if (created) return *this;
+					if (stristr(label, filter)) {
+						StaticString<256> label_full;
+						for (const auto& s : path) label_full.append(s, " / ");
+						label_full.add(label);
+						if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::Selectable(label_full)) {
+							Node* n = creator.create(*plugin->m_graph);
+							n->m_pos = pos;
+							plugin->pushUndo(NO_MERGE_UNDO);
+							filter[0] = '\0';
+							created = true;
 						}
 					}
-					ImGui::EndMenu();
+					return *this;
 				}
-			}
-			ImGui::EndMenu();
+				ImVec2 pos;
+				bool created = false;
+				VisualScriptEditorPlugin* plugin;
+				StackArray<StaticString<64>, 2> path;
+			} visitor(m_graph->m_allocator);
+			visitor.pos = pos;
+			visitor.plugin = this;
+			visitTypes(visitor);
+		}
+		else {
+			struct : INodeTypeVisitor {
+				bool beginCategory(const char* name) override { return ImGui::BeginMenu(name); }
+				void endCategory() override { return ImGui::EndMenu(); }
+				INodeTypeVisitor& visit(const char* label, ICreator& creator, char shortcut) override {
+					if (ImGui::Selectable(label)) {
+						Node* n = creator.create(*plugin->m_graph);
+						n->m_pos = pos;
+						plugin->pushUndo(NO_MERGE_UNDO);
+					}
+					return *this;
+				}
+				ImVec2 pos;
+				VisualScriptEditorPlugin* plugin;
+			} visitor;
+			visitor.pos = pos;
+			visitor.plugin = this;
+			visitTypes(visitor);
 		}
 	}
 
