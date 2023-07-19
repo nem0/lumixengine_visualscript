@@ -1535,9 +1535,6 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 		m_toggle_ui.func.bind<&VisualScriptEditorPlugin::onToggleUI>(this);
 		m_toggle_ui.is_selected.bind<&VisualScriptEditorPlugin::isOpen>(this);
 		
-		m_delete_action.init(ICON_FA_TRASH "Delete", "Visual script delete", "visual_script_editor_delete", ICON_FA_TRASH, os::Keycode::DEL, Action::Modifiers::NONE, true);
-		
-		app.addAction(&m_delete_action);
 		app.addWindowAction(&m_toggle_ui);
 
 		AssetCompiler& compiler = app.getAssetCompiler();
@@ -1557,11 +1554,10 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 		m_app.getPropertyGrid().removePlugin(m_property_grid_plugin);
 
 		m_app.removeAction(&m_toggle_ui);
-		m_app.removeAction(&m_delete_action);
 	}
 
 	bool onAction(const Action& action) override {
-		if (&m_delete_action == &action) deleteSelectedNodes();
+		if (&action == &m_app.getDeleteAction()) deleteSelectedNodes();
 		else if (&action == &m_app.getSaveAction()) save();
 		else if (&action == &m_app.getUndoAction()) undo();
 		else if (&action == &m_app.getRedoAction()) redo();
@@ -2014,7 +2010,6 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 	bool m_is_open = false;
 	Path m_path;
 	Action m_toggle_ui;
-	Action m_delete_action;
 	RecentPaths m_recent_paths;
 	bool m_show_save_as = false;
 	bool m_show_open = false;
