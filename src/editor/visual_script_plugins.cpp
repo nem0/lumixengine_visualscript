@@ -1535,25 +1535,8 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 		m_toggle_ui.func.bind<&VisualScriptEditorPlugin::onToggleUI>(this);
 		m_toggle_ui.is_selected.bind<&VisualScriptEditorPlugin::isOpen>(this);
 		
-		m_save_action.init(ICON_FA_SAVE "Save", "Visual script save", "visual_script_editor_save", ICON_FA_SAVE, os::Keycode::S, Action::Modifiers::CTRL, true);
-		m_save_action.func.bind<&VisualScriptEditorPlugin::save>(this);
-		m_save_action.plugin = this;
-		
-		m_undo_action.init(ICON_FA_UNDO "Undo", "Visual script undo", "visual_script_editor_undo", ICON_FA_UNDO, os::Keycode::Z, Action::Modifiers::CTRL, true);
-		m_undo_action.func.bind<&VisualScriptEditorPlugin::undo>((SimpleUndoRedo*)this);
-		m_undo_action.plugin = this;
-
-		m_redo_action.init(ICON_FA_REDO "Redo", "Visual script redo", "visual_script_editor_redo", ICON_FA_REDO, os::Keycode::Z, Action::Modifiers::CTRL | Action::Modifiers::SHIFT, true);
-		m_redo_action.func.bind<&VisualScriptEditorPlugin::redo>((SimpleUndoRedo*)this);
-		m_redo_action.plugin = this;
-
 		m_delete_action.init(ICON_FA_TRASH "Delete", "Visual script delete", "visual_script_editor_delete", ICON_FA_TRASH, os::Keycode::DEL, Action::Modifiers::NONE, true);
-		m_delete_action.func.bind<&VisualScriptEditorPlugin::deleteSelectedNodes>(this);
-		m_delete_action.plugin = this;
 		
-		app.addAction(&m_save_action);
-		app.addAction(&m_undo_action);
-		app.addAction(&m_redo_action);
 		app.addAction(&m_delete_action);
 		app.addWindowAction(&m_toggle_ui);
 
@@ -1574,13 +1557,19 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 		m_app.getPropertyGrid().removePlugin(m_property_grid_plugin);
 
 		m_app.removeAction(&m_toggle_ui);
-		m_app.removeAction(&m_save_action);
-		m_app.removeAction(&m_undo_action);
-		m_app.removeAction(&m_redo_action);
 		m_app.removeAction(&m_delete_action);
 	}
 
-	bool hasFocus() override { return m_has_focus; }
+	bool onAction(const Action& action) override {
+		if (&m_delete_action == &action) deleteSelectedNodes();
+		else if (&action == &m_app.getSaveAction()) save();
+		else if (&action == &m_app.getUndoAction()) undo();
+		else if (&action == &m_app.getRedoAction()) redo();
+		else return false;
+		return true;
+	}
+
+	bool hasFocus() const override { return m_has_focus; }
 	
 	void deleteSelectedNodes() {
 		for (i32 i = m_graph->m_nodes.size() - 1; i >= 0; --i) {
@@ -1861,14 +1850,14 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 			if (ImGui::BeginMenu("File")) {
 				if (ImGui::MenuItem("New")) newGraph();
 				if (ImGui::MenuItem("Open")) m_show_open = true;
-				menuItem(m_save_action, true);
+				menuItem(m_app.getSaveAction(), true);
 				if (ImGui::MenuItem("Save as")) m_show_save_as = true;
 				if (const char* path = m_recent_paths.menu(); path) { load(path); }
 				ImGui::EndMenu();
 			}
 			if (ImGui::BeginMenu("Edit")) {
-				menuItem(m_undo_action, canUndo());
-				menuItem(m_redo_action, canRedo());
+				menuItem(m_app.getUndoAction(), canUndo());
+				menuItem(m_app.getRedoAction(), canRedo());
 				ImGui::EndMenu();
 			}
 			if (ImGuiEx::IconButton(ICON_FA_FOLDER_OPEN, "Open")) m_show_open = true;
@@ -1881,7 +1870,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 		if (fs.gui("Save As", &m_show_save_as, "lvs", true)) saveAs(fs.getPath());
 	}
 
-	void onWindowGUI() override {
+	void onGUI() override {
 		m_has_focus = false;
 		if (!m_is_open) return;
 
@@ -2025,9 +2014,6 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 	bool m_is_open = false;
 	Path m_path;
 	Action m_toggle_ui;
-	Action m_save_action;
-	Action m_undo_action;
-	Action m_redo_action;
 	Action m_delete_action;
 	RecentPaths m_recent_paths;
 	bool m_show_save_as = false;
