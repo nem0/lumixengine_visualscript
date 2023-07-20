@@ -1481,8 +1481,7 @@ struct VisualScriptAssetPlugin : AssetBrowser::Plugin, AssetCompiler::IPlugin {
 	void deserialize(InputMemoryStream& blob) override { ASSERT(false); }
 	void serialize(OutputMemoryStream& blob) override {}
 
-	bool onGUI(Span<struct Resource*> resource) override { return false; }
-	void onResourceUnloaded(Resource* resource) override {}
+	bool onGUI(Span<AssetBrowser::ResourceView*> resource) override { return false; }
 	const char* getName() const override { return "visual_script"; }
 	ResourceType getResourceType() const override { return ScriptResource::TYPE; }
 
