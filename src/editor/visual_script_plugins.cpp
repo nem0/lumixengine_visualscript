@@ -1472,17 +1472,18 @@ struct VisualScriptPropertyGridPlugin : PropertyGrid::IPlugin {
 };
 
 struct VisualScriptAssetPlugin : AssetBrowser::Plugin, AssetCompiler::IPlugin {
-	VisualScriptAssetPlugin(StudioApp& app)
+	VisualScriptAssetPlugin(struct VisualScriptEditorPlugin& editor, StudioApp& app)
 		: AssetBrowser::Plugin(app.getAllocator())
 		, m_app(app)
-	{
-	}
+		, m_editor(editor)
+	{}
 
 	void deserialize(InputMemoryStream& blob) override { ASSERT(false); }
 	void serialize(OutputMemoryStream& blob) override {}
 
-	bool onGUI(Span<AssetBrowser::ResourceView*> resource) override { return false; }
-	const char* getName() const override { return "visual_script"; }
+	bool onGUI(Span<AssetBrowser::ResourceView*> resource) override;
+
+	const char* getName() const override { return "Visual script"; }
 	ResourceType getResourceType() const override { return ScriptResource::TYPE; }
 
 	bool compile(const Path& src) override {
@@ -1497,7 +1498,7 @@ struct VisualScriptAssetPlugin : AssetBrowser::Plugin, AssetCompiler::IPlugin {
 				return false;
 			}
 			compiled.write(wasm.data(), wasm.size());
-			return m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (i32)compiled.size()));
+			return m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (u32)compiled.size()));
 		}
 		else {
 			Graph graph(m_app.getAllocator());
@@ -1516,11 +1517,29 @@ struct VisualScriptAssetPlugin : AssetBrowser::Plugin, AssetCompiler::IPlugin {
 
 			OutputMemoryStream compiled(m_app.getAllocator());
 			graph.generate(compiled);
-			return m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (i32)compiled.size()));
+			return m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (u32)compiled.size()));
 		}
 	}
+	
+	bool canCreateResource() const { return true; }
 
+	bool createResource(const char* path) {
+		Graph graph(m_app.getAllocator());
+		graph.addNode<UpdateNode>(graph.m_allocator);
+		OutputMemoryStream blob(m_app.getAllocator());
+		graph.serialize(blob);
+
+		if (!m_app.getEngine().getFileSystem().saveContentSync(Path(path), blob)) {
+			logError("Failed to write ", path);
+			return false;
+		}
+		return true;
+	}
+
+	const char* getDefaultExtension() const override { return "lvs"; }
+	
 	StudioApp& m_app;
+	VisualScriptEditorPlugin& m_editor;
 };
 
 struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
@@ -1528,7 +1547,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 		: NodeEditor(app.getAllocator())	
 		, m_app(app)
 		, m_recent_paths("visual_script_editor_recent_", 10, app)
-		, m_asset_plugin(app)
+		, m_asset_plugin(*this, app)
 	{
 		m_toggle_ui.init("Visual Script Editor", "Toggle visual script editor", "visualScriptEditor", "", true);
 		m_toggle_ui.func.bind<&VisualScriptEditorPlugin::onToggleUI>(this);
@@ -2016,6 +2035,16 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 	VisualScriptAssetPlugin m_asset_plugin;
 	VisualScriptPropertyGridPlugin m_property_grid_plugin;
 };
+
+bool VisualScriptAssetPlugin::onGUI(Span<AssetBrowser::ResourceView*> resources) {
+	if (resources.length() > 1) return false;
+
+	if (ImGui::Button(ICON_FA_PENCIL_ALT " Edit")) {
+		m_editor.load(resources[0]->getPath());
+		if (!m_editor.isOpen()) m_editor.onToggleUI();
+	}
+	return false;
+}
 
 Node* Graph::createNode(Node::Type type) {
 	switch (type) {
