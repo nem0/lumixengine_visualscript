@@ -1523,17 +1523,10 @@ struct VisualScriptAssetPlugin : AssetBrowser::Plugin, AssetCompiler::IPlugin {
 	
 	bool canCreateResource() const { return true; }
 
-	bool createResource(const char* path) {
+	void createResource(OutputMemoryStream& blob) {
 		Graph graph(m_app.getAllocator());
 		graph.addNode<UpdateNode>(graph.m_allocator);
-		OutputMemoryStream blob(m_app.getAllocator());
 		graph.serialize(blob);
-
-		if (!m_app.getEngine().getFileSystem().saveContentSync(Path(path), blob)) {
-			logError("Failed to write ", path);
-			return false;
-		}
-		return true;
 	}
 
 	const char* getDefaultExtension() const override { return "lvs"; }
@@ -1864,14 +1857,14 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 			if (ImGui::BeginMenu("File")) {
 				if (ImGui::MenuItem("New")) newGraph();
 				if (ImGui::MenuItem("Open")) m_show_open = true;
-				menuItem(m_app.getSaveAction(), true);
+				if (menuItem(m_app.getSaveAction(), true)) save();
 				if (ImGui::MenuItem("Save as")) m_show_save_as = true;
 				if (const char* path = m_recent_paths.menu(); path) { load(path); }
 				ImGui::EndMenu();
 			}
 			if (ImGui::BeginMenu("Edit")) {
-				menuItem(m_app.getUndoAction(), canUndo());
-				menuItem(m_app.getRedoAction(), canRedo());
+				if (menuItem(m_app.getUndoAction(), canUndo())) undo();
+				if (menuItem(m_app.getRedoAction(), canRedo())) redo();
 				ImGui::EndMenu();
 			}
 			if (ImGuiEx::IconButton(ICON_FA_FOLDER_OPEN, "Open")) m_show_open = true;
