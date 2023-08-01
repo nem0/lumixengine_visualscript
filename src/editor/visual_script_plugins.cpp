@@ -2029,10 +2029,11 @@ struct VisualScriptEditor : StudioApp::IPlugin, PropertyGrid::IPlugin {
 		}
 
 		VisualScriptEditor& m_editor;
-	} m_asset_plugin;
+	};
 
 	TagAllocator m_allocator;
 	StudioApp& m_app;
+	AssetPlugin m_asset_plugin;
 };
 
 void VisualScriptEditorWindow::destroy() {
