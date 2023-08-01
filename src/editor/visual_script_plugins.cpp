@@ -923,10 +923,10 @@ struct ConstNode : Node {
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
 
-	ScriptValueType getOutputType(u32 idx, const Graph& graph) { return ScriptValueType::FLOAT; }
+	ScriptValueType getOutputType(u32 idx, const Graph& graph) override { return ScriptValueType::FLOAT; }
 
-	void serialize(OutputMemoryStream& blob) const { blob.write(m_value); }
-	void deserialize(InputMemoryStream& blob) { blob.read(m_value); }
+	void serialize(OutputMemoryStream& blob) const override { blob.write(m_value); }
+	void deserialize(InputMemoryStream& blob) override { blob.read(m_value); }
 
 	bool onGUI() override {
 		outputPin();
@@ -947,8 +947,8 @@ struct SwitchNode : Node {
 	bool hasInputPins() const override { return true; }
 	bool hasOutputPins() const override { return true; }
 
-	void serialize(OutputMemoryStream& blob) const { blob.write(m_is_on); }
-	void deserialize(InputMemoryStream& blob) { blob.read(m_is_on); }
+	void serialize(OutputMemoryStream& blob) const override { blob.write(m_is_on); }
+	void deserialize(InputMemoryStream& blob) override { blob.read(m_is_on); }
 
 	bool onGUI() override {
 		nodeTitle("Switch", true, false);
@@ -981,7 +981,7 @@ struct KeyInputNode : Node {
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
 
-	ScriptValueType getOutputType(u32 idx, const Graph& graph) { return ScriptValueType::I32; }
+	ScriptValueType getOutputType(u32 idx, const Graph& graph) override { return ScriptValueType::I32; }
 
 	bool onGUI() override {
 		nodeTitle(ICON_FA_KEY " Key input", false, true);
@@ -1016,7 +1016,7 @@ struct MouseMoveNode : Node {
 	bool hasInputPins() const override { return false; }
 	bool hasOutputPins() const override { return true; }
 
-	ScriptValueType getOutputType(u32 idx, const Graph& graph) { return ScriptValueType::FLOAT; }
+	ScriptValueType getOutputType(u32 idx, const Graph& graph) override { return ScriptValueType::FLOAT; }
 
 
 	bool onGUI() override {
@@ -1903,35 +1903,22 @@ Node* Graph::createNode(Node::Type type) {
 	return nullptr;
 }
 
-struct VisualScriptEditor : StudioApp::IPlugin, EditorAssetPlugin, PropertyGrid::IPlugin {
+struct VisualScriptEditor : StudioApp::IPlugin, PropertyGrid::IPlugin {
 	VisualScriptEditor(StudioApp& app)
-		: EditorAssetPlugin("Visual script", "lvs", ScriptResource::TYPE, app, m_allocator)
-		, m_allocator(app.getAllocator(), "visual script editor")
+		: m_allocator(app.getAllocator(), "visual script editor")
 		, m_app(app)
+		, m_asset_plugin(*this)
 	{
 		AssetCompiler& compiler = app.getAssetCompiler();
 		compiler.registerExtension("wasm", ScriptResource::TYPE);
 		const char* exts[] = { "wasm", nullptr };
-		compiler.addPlugin(*this, exts);
+		compiler.addPlugin(m_asset_plugin, exts);
 
 		app.getPropertyGrid().addPlugin(*this);
 	}
 
 	~VisualScriptEditor() {
 		m_app.getPropertyGrid().removePlugin(*this);
-	}
-
-	void onResourceDoubleClicked(const Path& path) override { open(path); }
-
-	void open(const Path& path) {
-		AssetBrowser& ab = m_app.getAssetBrowser();
-		if (AssetEditorWindow* win = ab.getWindow(path)) {
-			win->m_focus_request = true;
-			return;
-		}
-	
-		VisualScriptEditorWindow* new_win = LUMIX_NEW(m_allocator, VisualScriptEditorWindow)(path, *this, m_app, m_allocator);
-		ab.addWindow(new_win);
 	}
 
 	void onGUI(PropertyGrid& grid, Span<const EntityRef> entities, ComponentType cmp_type, WorldEditor& editor) override {
@@ -1969,59 +1956,80 @@ struct VisualScriptEditor : StudioApp::IPlugin, EditorAssetPlugin, PropertyGrid:
 		}
 	}
 
-	bool onGUI(Span<AssetBrowser::ResourceView*> resources) {
-		if (resources.length() > 1) return false;
-
-		if (ImGui::Button(ICON_FA_PENCIL_ALT " Edit")) {
-			open(resources[0]->getPath());
+	void open(const Path& path) {
+		AssetBrowser& ab = m_app.getAssetBrowser();
+		if (AssetEditorWindow* win = ab.getWindow(path)) {
+			win->m_focus_request = true;
+			return;
 		}
-		return false;
-	}
-
-	bool compile(const Path& src) override {
-		if (Path::hasExtension(src.c_str(), "wasm")) {
-			ScriptResource::Header header;
-			OutputMemoryStream compiled(m_allocator);
-			compiled.write(header);
-			FileSystem& fs = m_app.getEngine().getFileSystem();
-			OutputMemoryStream wasm(m_allocator);
-			if (!fs.getContentSync(src, wasm)) {
-				logError("Failed to read ", src);
-				return false;
-			}
-			compiled.write(wasm.data(), wasm.size());
-			return m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (u32)compiled.size()));
-		}
-		else {
-			Graph graph(Path(), m_allocator);
-			FileSystem& fs = m_app.getEngine().getFileSystem();
-		
-			OutputMemoryStream blob(m_allocator);
-			if (!fs.getContentSync(src, blob)) {
-				logError("Failed to read ", src);
-				return false;
-			}
-			InputMemoryStream iblob(blob);
-			if (!graph.deserialize(iblob)) {
-				logError("Failed to deserialize ", src);
-				return false;
-			}
-
-			OutputMemoryStream compiled(m_allocator);
-			graph.generate(compiled);
-			return m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (u32)compiled.size()));
-		}
-	}
-
-	void createResource(OutputMemoryStream& blob) {
-		Graph graph(Path(), m_allocator);
-		graph.addNode<UpdateNode>(graph.m_allocator);
-		graph.serialize(blob);
+	
+		VisualScriptEditorWindow* new_win = LUMIX_NEW(m_allocator, VisualScriptEditorWindow)(path, *this, m_app, m_allocator);
+		ab.addWindow(new_win);
 	}
 
 	void init() override {}
-	const char* StudioApp::IPlugin::getName() const override { return "visual_script_editor"; }
+	const char* getName() const override { return "visual_script_editor"; }
 	bool showGizmo(struct WorldView& view, struct ComponentUID cmp) override { return false; }
+
+	struct AssetPlugin : EditorAssetPlugin {
+		AssetPlugin(VisualScriptEditor& editor)
+			: EditorAssetPlugin("Visual script", "lvs", ScriptResource::TYPE, editor.m_app, editor.m_allocator)
+			, m_editor(editor)
+		{}
+
+		void onResourceDoubleClicked(const Path& path) override { m_editor.open(path); }
+
+		bool onGUI(Span<AssetBrowser::ResourceView*> resources) override {
+			if (resources.length() > 1) return false;
+
+			if (ImGui::Button(ICON_FA_PENCIL_ALT " Edit")) {
+				m_editor.open(resources[0]->getPath());
+			}
+			return false;
+		}
+
+		bool compile(const Path& src) override {
+			FileSystem& fs = m_editor.m_app.getEngine().getFileSystem();
+			if (Path::hasExtension(src.c_str(), "wasm")) {
+				ScriptResource::Header header;
+				OutputMemoryStream compiled(m_editor.m_allocator);
+				compiled.write(header);
+				OutputMemoryStream wasm(m_editor.m_allocator);
+				if (!fs.getContentSync(src, wasm)) {
+					logError("Failed to read ", src);
+					return false;
+				}
+				compiled.write(wasm.data(), wasm.size());
+				return m_editor.m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (u32)compiled.size()));
+			}
+			else {
+				Graph graph(Path(), m_editor.m_allocator);
+			
+				OutputMemoryStream blob(m_editor.m_allocator);
+				if (!fs.getContentSync(src, blob)) {
+					logError("Failed to read ", src);
+					return false;
+				}
+				InputMemoryStream iblob(blob);
+				if (!graph.deserialize(iblob)) {
+					logError("Failed to deserialize ", src);
+					return false;
+				}
+
+				OutputMemoryStream compiled(m_editor.m_allocator);
+				graph.generate(compiled);
+				return m_editor.m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (u32)compiled.size()));
+			}
+		}
+
+		void createResource(OutputMemoryStream& blob) override {
+			Graph graph(Path(), m_editor.m_allocator);
+			graph.addNode<UpdateNode>(graph.m_allocator);
+			graph.serialize(blob);
+		}
+
+		VisualScriptEditor& m_editor;
+	} m_asset_plugin;
 
 	TagAllocator m_allocator;
 	StudioApp& m_app;
