@@ -1,5 +1,6 @@
 #include "editor/asset_browser.h"
 #include "editor/asset_compiler.h"
+#include "editor/editor_asset.h"
 #include "editor/property_grid.h"
 #include "editor/settings.h"
 #include "editor/studio_app.h"
@@ -22,6 +23,8 @@
 
 
 using namespace Lumix;
+
+namespace {
 
 static const u32 OUTPUT_FLAG = NodeEditor::OUTPUT_FLAG;
 static const ComponentType SCRIPT_TYPE = reflection::getComponentType("script");
@@ -432,17 +435,33 @@ struct WASMWriter {
 };
 
 struct Graph {
-	Graph(IAllocator& allocator)
+	Graph(const Path& path, IAllocator& allocator)
 		: m_allocator(allocator)
 		, m_nodes(allocator)
 		, m_links(allocator)
 		, m_variables(allocator)
+		, m_path(path)
 	{}
 
 	~Graph() {
 		for (Node* n : m_nodes) {
 			LUMIX_DELETE(m_allocator, n);
 		}
+	}
+
+	bool load(const Path& path, FileSystem& fs) {
+		OutputMemoryStream content(m_allocator);
+		if (!fs.getContentSync(path, content)) {
+			logError("Failed to read ", path);
+			return false;
+		}
+		
+		InputMemoryStream blob(content);
+		if (!deserialize(blob)) {
+			logError("Failed to deserialize ", path);
+			return false;
+		}
+		return true;
 	}
 
 	static constexpr u32 MAGIC = '_LVS';
@@ -497,13 +516,22 @@ struct Graph {
 		writer.write(blob, *this);
 	}
 
+	void clear() {
+		for (Node* n : m_nodes) {
+			LUMIX_DELETE(m_allocator, n);
+		}
+		m_nodes.clear();
+		m_links.clear();
+		m_variables.clear();
+	}
+
 	bool deserialize(InputMemoryStream& blob) {
 		const u32 magic = blob.read<u32>();
 		if (magic != MAGIC) return false;
 		const u32 version = blob.read<u32>();
 		if (version != 0) return false;
 		
-		blob.read(node_counter_);
+		blob.read(m_node_counter);
 		const u32 var_count = blob.read<u32>();
 		m_variables.reserve(var_count);
 		for (u32 i = 0; i < var_count; ++i) {
@@ -537,7 +565,7 @@ struct Graph {
 		blob.write(MAGIC);
 		const u32 version = 0;
 		blob.write(version);
-		blob.write(node_counter_);
+		blob.write(m_node_counter);
 		
 		blob.write(m_variables.size());
 		for (const Variable& var : m_variables) {
@@ -559,16 +587,10 @@ struct Graph {
 		}
 	}
 
-	IAllocator& m_allocator;
-	Array<Node*> m_nodes;
-	Array<NodeEditorLink> m_links;
-	Array<Variable> m_variables;
-
-	u32 node_counter_ = 0;
 	template <typename T, typename... Args>
 	Node* addNode(Args&&... args) {
 		Node* n = LUMIX_NEW(m_allocator, T)(static_cast<Args&&>(args)...);
-		n->m_id = ++node_counter_;
+		n->m_id = ++m_node_counter;
 		m_nodes.push(n);
 		return n;
 	}
@@ -591,6 +613,14 @@ struct Graph {
 		const i32 idx = m_nodes.find([&](const Node* node){ return node->m_id == id; });
 		return idx < 0 ? nullptr : m_nodes[idx];
 	}
+
+	IAllocator& m_allocator;
+	Array<Node*> m_nodes;
+	Array<NodeEditorLink> m_links;
+	Array<Variable> m_variables;
+	Path m_path;
+
+	u32 m_node_counter = 0;
 };
 
 Node::NodeInput Node::getOutputNode(u32 idx, const Graph& graph) {
@@ -1112,7 +1142,6 @@ struct UpdateNode : Node {
 	}
 };
 
-
 struct MulNode : Node {
 	MulNode(IAllocator& allocator)
 		: Node(allocator)
@@ -1434,162 +1463,46 @@ struct SetPropertyNode : Node {
 	ComponentType cmp_type = INVALID_COMPONENT_TYPE;
 };
 
-struct VisualScriptPropertyGridPlugin : PropertyGrid::IPlugin {
-	void onGUI(PropertyGrid& grid, Span<const EntityRef> entities, ComponentType cmp_type, WorldEditor& editor) override {
-		if (cmp_type != SCRIPT_TYPE) return;
-		if (entities.length() != 1) return;
-
-		World* world = editor.getWorld();
-		ScriptModule* module = (ScriptModule*)world->getModule(SCRIPT_TYPE);
-		Script& script = module->getScript(entities[0]);
-		
-		if (!script.m_resource) return;
-		if (!script.m_resource->isReady()) return;
-		if (!script.m_module) return;
-
-		for (i32 i = 0; i < m3l_getGlobalCount(script.m_module); ++i) {
-			const char* name = m3l_getGlobalName(script.m_module, i);
-			if (!name) continue;
-			IM3Global global = m3_FindGlobal(script.m_module, name);
-			M3TaggedValue val;
-			m3_GetGlobal(global, &val);
-			switch (val.type) {
-				case M3ValueType::c_m3Type_none:
-				case M3ValueType::c_m3Type_unknown:
-				case M3ValueType::c_m3Type_i64:
-				case M3ValueType::c_m3Type_f64:
-					ASSERT(false); // TODO
-					break;
-				case M3ValueType::c_m3Type_i32:
-					ImGui::LabelText(name, "%d", val.value.i32);
-					break;
-				case M3ValueType::c_m3Type_f32:
-					ImGui::LabelText(name, "%f", val.value.f32);
-					break;
-			}
-		}
-	}
-};
-
-struct VisualScriptAssetPlugin : AssetBrowser::Plugin, AssetCompiler::IPlugin {
-	VisualScriptAssetPlugin(struct VisualScriptEditorPlugin& editor, StudioApp& app)
-		: AssetBrowser::Plugin(app.getAllocator())
+struct VisualScriptEditorWindow : AssetEditorWindow, NodeEditor {
+	VisualScriptEditorWindow(const Path& path, struct VisualScriptEditor& editor, StudioApp& app, IAllocator& allocator) 
+		: NodeEditor(allocator)
+		, AssetEditorWindow(app)
 		, m_app(app)
+		, m_allocator(allocator)
 		, m_editor(editor)
-	{}
-
-	void deserialize(InputMemoryStream& blob) override { ASSERT(false); }
-	void serialize(OutputMemoryStream& blob) override {}
-
-	bool onGUI(Span<AssetBrowser::ResourceView*> resource) override;
-
-	const char* getName() const override { return "Visual script"; }
-	ResourceType getResourceType() const override { return ScriptResource::TYPE; }
-
-	bool compile(const Path& src) override {
-		if (Path::hasExtension(src.c_str(), "wasm")) {
-			ScriptResource::Header header;
-			OutputMemoryStream compiled(m_app.getAllocator());
-			compiled.write(header);
-			FileSystem& fs = m_app.getEngine().getFileSystem();
-			OutputMemoryStream wasm(m_app.getAllocator());
-			if (!fs.getContentSync(src, wasm)) {
-				logError("Failed to read ", src);
-				return false;
-			}
-			compiled.write(wasm.data(), wasm.size());
-			return m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (u32)compiled.size()));
-		}
-		else {
-			Graph graph(m_app.getAllocator());
-			FileSystem& fs = m_app.getEngine().getFileSystem();
-		
-			OutputMemoryStream blob(m_app.getAllocator());
-			if (!fs.getContentSync(src, blob)) {
-				logError("Failed to read ", src);
-				return false;
-			}
-			InputMemoryStream iblob(blob);
-			if (!graph.deserialize(iblob)) {
-				logError("Failed to deserialize ", src);
-				return false;
-			}
-
-			OutputMemoryStream compiled(m_app.getAllocator());
-			graph.generate(compiled);
-			return m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (u32)compiled.size()));
-		}
-	}
-	
-	bool canCreateResource() const { return true; }
-
-	void createResource(OutputMemoryStream& blob) {
-		Graph graph(m_app.getAllocator());
-		graph.addNode<UpdateNode>(graph.m_allocator);
-		graph.serialize(blob);
-	}
-
-	const char* getDefaultExtension() const override { return "lvs"; }
-	
-	StudioApp& m_app;
-	VisualScriptEditorPlugin& m_editor;
-};
-
-struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
-	VisualScriptEditorPlugin (StudioApp& app) 
-		: NodeEditor(app.getAllocator())	
-		, m_app(app)
-		, m_recent_paths("visual_script_editor_recent_", 10, app)
-		, m_asset_plugin(*this, app)
+		, m_graph(path, m_allocator)
 	{
-		m_toggle_ui.init("Visual Script Editor", "Toggle visual script editor", "visualScriptEditor", "", true);
-		m_toggle_ui.func.bind<&VisualScriptEditorPlugin::onToggleUI>(this);
-		m_toggle_ui.is_selected.bind<&VisualScriptEditorPlugin::isOpen>(this);
-		
-		app.addWindowAction(&m_toggle_ui);
-
-		AssetCompiler& compiler = app.getAssetCompiler();
-		compiler.registerExtension("lvs", ScriptResource::TYPE);
-		compiler.registerExtension("wasm", ScriptResource::TYPE);
-		const char* exts[] = { "lvs", "wasm", nullptr };
-		compiler.addPlugin(m_asset_plugin, exts);
-
-		app.getAssetBrowser().addPlugin(m_asset_plugin);
-		app.getPropertyGrid().addPlugin(m_property_grid_plugin);
-		newGraph();
-	}
-	
-	~VisualScriptEditorPlugin() {
-		m_app.getAssetCompiler().removePlugin(m_asset_plugin);
-		m_app.getAssetBrowser().removePlugin(m_asset_plugin);
-		m_app.getPropertyGrid().removePlugin(m_property_grid_plugin);
-
-		m_app.removeAction(&m_toggle_ui);
+		m_graph.load(path, app.getEngine().getFileSystem());
+		pushUndo(NO_MERGE_UNDO);
+		m_dirty = false;
 	}
 
 	bool onAction(const Action& action) override {
 		if (&action == &m_app.getDeleteAction()) deleteSelectedNodes();
-		else if (&action == &m_app.getSaveAction()) save();
+		else if (&action == &m_app.getSaveAction()) saveAs(m_graph.m_path);
 		else if (&action == &m_app.getUndoAction()) undo();
 		else if (&action == &m_app.getRedoAction()) redo();
 		else return false;
 		return true;
 	}
 
-	bool hasFocus() const override { return m_has_focus; }
-	
+	void pushUndo(u32 tag) override {
+		SimpleUndoRedo::pushUndo(tag);
+		m_dirty = true;
+	}
+
 	void deleteSelectedNodes() {
-		for (i32 i = m_graph->m_nodes.size() - 1; i >= 0; --i) {
-			Node* node = m_graph->m_nodes[i];
+		for (i32 i = m_graph.m_nodes.size() - 1; i >= 0; --i) {
+			Node* node = m_graph.m_nodes[i];
 			if (node->m_selected) {
-				for (i32 j = m_graph->m_links.size() - 1; j >= 0; --j) {
-					if (m_graph->m_links[j].getFromNode() == node->m_id || m_graph->m_links[j].getToNode() == node->m_id) {
-						m_graph->m_links.erase(j);
+				for (i32 j = m_graph.m_links.size() - 1; j >= 0; --j) {
+					if (m_graph.m_links[j].getFromNode() == node->m_id || m_graph.m_links[j].getToNode() == node->m_id) {
+						m_graph.m_links.erase(j);
 					}
 				}
 
-				LUMIX_DELETE(m_graph->m_allocator, node);
-				m_graph->m_nodes.swapAndPop(i);
+				LUMIX_DELETE(m_graph.m_allocator, node);
+				m_graph.m_nodes.swapAndPop(i);
 			}
 		}
 		pushUndo(NO_MERGE_UNDO);
@@ -1626,26 +1539,26 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 		}
 		
 		if (visitor.beginCategory("Set variable")) {
-			for (const Variable& var : m_graph->m_variables) {
+			for (const Variable& var : m_graph.m_variables) {
 				struct : INodeTypeVisitor::ICreator {
 					Node* create(Graph& graph) override { return graph.addNode<SetVariableNode>(graph, idx); }
 					u32 idx;
 				} creator;
-				creator.idx = u32(&var - m_graph->m_variables.begin());
+				creator.idx = u32(&var - m_graph.m_variables.begin());
 				if (var.name.length() > 0) visitor.visit(var.name.c_str(), creator);
 			}
 			visitor.endCategory();
 		}
 
 		if (visitor.beginCategory("Get variable")) {
-			for (const Variable& var : m_graph->m_variables) {
+			for (const Variable& var : m_graph.m_variables) {
 				struct : INodeTypeVisitor::ICreator {
 					Node* create(Graph& graph) override {
 						return graph.addNode<GetVariableNode>(graph, idx);
 					}
 					u32 idx;
 				} creator;
-				creator.idx = u32(&var - m_graph->m_variables.begin());
+				creator.idx = u32(&var - m_graph.m_variables.begin());
 				if (var.name.length() > 0) visitor.visit(var.name.c_str(), creator);
 			}
 			visitor.endCategory();
@@ -1754,18 +1667,18 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 		struct : INodeTypeVisitor {
 			INodeTypeVisitor& visit(const char* label, ICreator& creator, char shortcut = 0) override {
 				if (shortcut && os::isKeyDown((os::Keycode)shortcut)) {
-					n = creator.create(*plugin->m_graph);
+					n = creator.create(plugin->m_graph);
 				}
 				return *this;
 			}
-			VisualScriptEditorPlugin* plugin;
+			VisualScriptEditorWindow* plugin;
 			Node* n = nullptr;
 		} visitor;
 		visitor.plugin = this;
 		visitTypes(visitor);
 		if (visitor.n) {
 			visitor.n->m_pos = pos;
-			if (hovered_link >= 0) splitLink(m_graph->m_nodes.back(), m_graph->m_links, hovered_link);
+			if (hovered_link >= 0) splitLink(m_graph.m_nodes.back(), m_graph.m_links, hovered_link);
 			pushUndo(NO_MERGE_UNDO);
 		}
 	}
@@ -1773,93 +1686,35 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 	void onLinkDoubleClicked(NodeEditorLink& link, ImVec2 pos) override {}
 	
 	void deserialize(InputMemoryStream& blob) override {
-		m_graph.destroy();
-		m_graph.create(m_app.getAllocator());
-		m_graph->deserialize(blob);
+		m_graph.clear();
+		m_graph.deserialize(blob);
 	}
 
 	void serialize(OutputMemoryStream& blob) override {
-		m_graph->serialize(blob);
-	}
-
-	void onToggleUI() { m_is_open = !m_is_open; }
-	bool isOpen() const { return m_is_open; }
-
-	void onSettingsLoaded() override {
-		Settings& settings = m_app.getSettings();
-		
-		m_is_open = settings.getValue(Settings::GLOBAL, "is_visualscript_editor_open", false);
-		m_recent_paths.onSettingsLoaded();
-	}
-
-	void onBeforeSettingsSaved() override {
-		Settings& settings = m_app.getSettings();
-		settings.setValue(Settings::GLOBAL, "is_visualscript_editor_open", m_is_open);
-		m_recent_paths.onBeforeSettingsSaved();
-	}
-
-	void save() {
-		if (m_path.isEmpty()) m_show_save_as = true;
-		else saveAs(m_path.c_str());
+		m_graph.serialize(blob);
 	}
 
 	void saveAs(const char* path) {
 		ASSERT(path[0]);
-		OutputMemoryStream tmp(m_app.getAllocator());
-		m_graph->generate(tmp); // to update errors
-		OutputMemoryStream blob(m_app.getAllocator());
-		m_graph->serialize(blob);
+		OutputMemoryStream tmp(m_allocator);
+		m_graph.generate(tmp); // to update errors
+		OutputMemoryStream blob(m_allocator);
+		m_graph.serialize(blob);
 		FileSystem& fs = m_app.getEngine().getFileSystem();
 		if (!fs.saveContentSync(Path(path), blob)) {
 			logError("Failed to save ", path);
 		}
 		else {
-			setPath(path);
+			m_graph.m_path = path;
+			m_dirty = false;
 		}
-	}
-
-	void setPath(const char* path) {
-		m_path = path;
-		m_recent_paths.push(m_path.c_str());
-	}
-
-	void load(const char* path) {
-		FileSystem& fs = m_app.getEngine().getFileSystem();
-		OutputMemoryStream blob(m_app.getAllocator());
-		if (!fs.getContentSync(Path(path), blob)) {
-			logError("Failed to read ", path);
-			return;
-		}
-
-		m_graph.destroy();
-		m_graph.create(m_app.getAllocator());
-		if (m_graph->deserialize(InputMemoryStream(blob))) {
-			pushUndo(NO_MERGE_UNDO);
-			setPath(path);
-			return;
-		}
-
-		m_graph.destroy();
-		m_graph.create(m_app.getAllocator());
-		pushUndo(NO_MERGE_UNDO);
-	}
-
-	void newGraph() {
-		if (m_graph.get()) m_graph.destroy();
-		m_graph.create(m_app.getAllocator());
-		m_path = "";
-		m_graph->addNode<UpdateNode>(m_graph->m_allocator);
-		pushUndo(NO_MERGE_UNDO);
 	}
 
 	void menu() {
 		if (ImGui::BeginMenuBar()) {
 			if (ImGui::BeginMenu("File")) {
-				if (ImGui::MenuItem("New")) newGraph();
-				if (ImGui::MenuItem("Open")) m_show_open = true;
-				if (menuItem(m_app.getSaveAction(), true)) save();
+				if (menuItem(m_app.getSaveAction(), true)) saveAs(m_graph.m_path);
 				if (ImGui::MenuItem("Save as")) m_show_save_as = true;
-				if (const char* path = m_recent_paths.menu(); path) { load(path); }
 				ImGui::EndMenu();
 			}
 			if (ImGui::BeginMenu("Edit")) {
@@ -1867,58 +1722,52 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 				if (menuItem(m_app.getRedoAction(), canRedo())) redo();
 				ImGui::EndMenu();
 			}
-			if (ImGuiEx::IconButton(ICON_FA_FOLDER_OPEN, "Open")) m_show_open = true;
-			if (ImGuiEx::IconButton(ICON_FA_SAVE, "Save")) save();
+			if (ImGuiEx::IconButton(ICON_FA_SAVE, "Save")) saveAs(m_graph.m_path);
+			if (ImGuiEx::IconButton(ICON_FA_UNDO, "Undo", canUndo())) undo();
+			if (ImGuiEx::IconButton(ICON_FA_REDO, "Redo", canRedo())) redo();
 			ImGui::EndMenuBar();
 		}
 
 		FileSelector& fs = m_app.getFileSelector();
-		if (fs.gui("Open", &m_show_open, "lvs", false)) load(fs.getPath());
 		if (fs.gui("Save As", &m_show_save_as, "lvs", true)) saveAs(fs.getPath());
 	}
 
-	void onGUI() override {
-		m_has_focus = false;
-		if (!m_is_open) return;
+	void destroy() override;
+	
+	const Path& getPath() override { return m_graph.m_path; }
 
-		i32 hovered_node = -1;
-		i32 hovered_link = -1;
-		ImGui::SetNextWindowSize(ImVec2(200, 200), ImGuiCond_FirstUseEver);
-		if (ImGui::Begin("Visual script", &m_is_open, ImGuiWindowFlags_MenuBar)) {
-			m_has_focus = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
-			menu();
-			ImGui::Columns(2);
-			static bool once = [](){ ImGui::SetColumnWidth(-1, 150); return true; }();
-			for (Variable& var : m_graph->m_variables) {
-				ImGui::PushID(&var);
-				if (ImGuiEx::IconButton(ICON_FA_TRASH, "Delete")) {
-					m_graph->m_variables.erase(u32(&var - m_graph->m_variables.begin()));
-					ImGui::PopID();
-					break;
-				}
-				ImGui::SameLine();
-				ImGui::SetNextItemWidth(75);
-				ImGui::Combo("##type", (i32*)&var.type, "u32\0i32\0float\0entity\0");
-				ImGui::SameLine();
-				char buf[128];
-				copyString(buf, var.name.c_str());
-				ImGui::SetNextItemWidth(-1);
-				if (ImGui::InputText("##", buf, sizeof(buf))) {
-					var.name = buf;
-				}
+	void windowGUI() override {
+		menu();
+		ImGui::Columns(2);
+		static bool once = [](){ ImGui::SetColumnWidth(-1, 150); return true; }();
+		for (Variable& var : m_graph.m_variables) {
+			ImGui::PushID(&var);
+			if (ImGuiEx::IconButton(ICON_FA_TRASH, "Delete")) {
+				m_graph.m_variables.erase(u32(&var - m_graph.m_variables.begin()));
 				ImGui::PopID();
+				break;
 			}
-			if (ImGui::Button(ICON_FA_PLUS " Add variable")) {
-				m_graph->m_variables.emplace(m_app.getAllocator());
+			ImGui::SameLine();
+			ImGui::SetNextItemWidth(75);
+			ImGui::Combo("##type", (i32*)&var.type, "u32\0i32\0float\0entity\0");
+			ImGui::SameLine();
+			char buf[128];
+			copyString(buf, var.name.c_str());
+			ImGui::SetNextItemWidth(-1);
+			if (ImGui::InputText("##", buf, sizeof(buf))) {
+				var.name = buf;
 			}
-			
-			ImGui::NextColumn();
-			static ImVec2 offset = ImVec2(0, 0);
-			const ImVec2 editor_pos = ImGui::GetCursorScreenPos();
-			nodeEditorGUI(m_graph->m_nodes, m_graph->m_links);
-			ImGui::Columns();
+			ImGui::PopID();
 		}
-		ImGui::End();
+		if (ImGui::Button(ICON_FA_PLUS " Add variable")) {
+			m_graph.m_variables.emplace(m_allocator);
+		}
+			
+		ImGui::NextColumn();
+		static ImVec2 offset = ImVec2(0, 0);
+		const ImVec2 editor_pos = ImGui::GetCursorScreenPos();
+		nodeEditorGUI(m_graph.m_nodes, m_graph.m_links);
+		ImGui::Columns();
 	}
 
 	bool propertyList(ComponentType& cmp_type, Span<char> property_name) {
@@ -1975,7 +1824,7 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 						for (const auto& s : path) label_full.append(s, " / ");
 						label_full.add(label);
 						if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::Selectable(label_full)) {
-							Node* n = creator.create(*plugin->m_graph);
+							Node* n = creator.create(plugin->m_graph);
 							n->m_pos = pos;
 							plugin->pushUndo(NO_MERGE_UNDO);
 							filter[0] = '\0';
@@ -1986,9 +1835,9 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 				}
 				ImVec2 pos;
 				bool created = false;
-				VisualScriptEditorPlugin* plugin;
+				VisualScriptEditorWindow* plugin;
 				StackArray<StaticString<64>, 2> path;
-			} visitor(m_graph->m_allocator);
+			} visitor(m_graph.m_allocator);
 			visitor.pos = pos;
 			visitor.plugin = this;
 			visitTypes(visitor);
@@ -1999,14 +1848,14 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 				void endCategory() override { return ImGui::EndMenu(); }
 				INodeTypeVisitor& visit(const char* label, ICreator& creator, char shortcut) override {
 					if (ImGui::Selectable(label)) {
-						Node* n = creator.create(*plugin->m_graph);
+						Node* n = creator.create(plugin->m_graph);
 						n->m_pos = pos;
 						plugin->pushUndo(NO_MERGE_UNDO);
 					}
 					return *this;
 				}
 				ImVec2 pos;
-				VisualScriptEditorPlugin* plugin;
+				VisualScriptEditorWindow* plugin;
 			} visitor;
 			visitor.pos = pos;
 			visitor.plugin = this;
@@ -2016,28 +1865,12 @@ struct VisualScriptEditorPlugin : StudioApp::GUIPlugin, NodeEditor {
 
 	const char* getName() const override { return "visualscript"; }
 
+	IAllocator& m_allocator;
 	StudioApp& m_app;
-	Local<Graph> m_graph;
-	bool m_is_open = false;
-	Path m_path;
-	Action m_toggle_ui;
-	RecentPaths m_recent_paths;
+	VisualScriptEditor& m_editor;
+	Graph m_graph;
 	bool m_show_save_as = false;
-	bool m_show_open = false;
-	bool m_has_focus = false;
-	VisualScriptAssetPlugin m_asset_plugin;
-	VisualScriptPropertyGridPlugin m_property_grid_plugin;
 };
-
-bool VisualScriptAssetPlugin::onGUI(Span<AssetBrowser::ResourceView*> resources) {
-	if (resources.length() > 1) return false;
-
-	if (ImGui::Button(ICON_FA_PENCIL_ALT " Edit")) {
-		m_editor.load(resources[0]->getPath());
-		if (!m_editor.isOpen()) m_editor.onToggleUI();
-	}
-	return false;
-}
 
 Node* Graph::createNode(Node::Type type) {
 	switch (type) {
@@ -2070,9 +1903,139 @@ Node* Graph::createNode(Node::Type type) {
 	return nullptr;
 }
 
+struct VisualScriptEditor : StudioApp::IPlugin, EditorAssetPlugin, PropertyGrid::IPlugin {
+	VisualScriptEditor(StudioApp& app)
+		: EditorAssetPlugin("Visual script", "lvs", ScriptResource::TYPE, app, m_allocator)
+		, m_allocator(app.getAllocator(), "visual script editor")
+		, m_app(app)
+	{
+		AssetCompiler& compiler = app.getAssetCompiler();
+		compiler.registerExtension("wasm", ScriptResource::TYPE);
+		const char* exts[] = { "wasm", nullptr };
+		compiler.addPlugin(*this, exts);
+
+		app.getPropertyGrid().addPlugin(*this);
+	}
+
+	~VisualScriptEditor() {
+		m_app.getPropertyGrid().removePlugin(*this);
+	}
+
+	void onResourceDoubleClicked(const Path& path) override { open(path); }
+
+	void open(const Path& path) {
+		AssetBrowser& ab = m_app.getAssetBrowser();
+		if (AssetEditorWindow* win = ab.getWindow(path)) {
+			win->m_focus_request = true;
+			return;
+		}
+	
+		VisualScriptEditorWindow* new_win = LUMIX_NEW(m_allocator, VisualScriptEditorWindow)(path, *this, m_app, m_allocator);
+		ab.addWindow(new_win);
+	}
+
+	void onGUI(PropertyGrid& grid, Span<const EntityRef> entities, ComponentType cmp_type, WorldEditor& editor) override {
+		if (cmp_type != SCRIPT_TYPE) return;
+		if (entities.length() != 1) return;
+
+		World* world = editor.getWorld();
+		ScriptModule* module = (ScriptModule*)world->getModule(SCRIPT_TYPE);
+		Script& script = module->getScript(entities[0]);
+		
+		if (!script.m_resource) return;
+		if (!script.m_resource->isReady()) return;
+		if (!script.m_module) return;
+
+		for (i32 i = 0; i < m3l_getGlobalCount(script.m_module); ++i) {
+			const char* name = m3l_getGlobalName(script.m_module, i);
+			if (!name) continue;
+			IM3Global global = m3_FindGlobal(script.m_module, name);
+			M3TaggedValue val;
+			m3_GetGlobal(global, &val);
+			switch (val.type) {
+				case M3ValueType::c_m3Type_none:
+				case M3ValueType::c_m3Type_unknown:
+				case M3ValueType::c_m3Type_i64:
+				case M3ValueType::c_m3Type_f64:
+					ASSERT(false); // TODO
+					break;
+				case M3ValueType::c_m3Type_i32:
+					ImGui::LabelText(name, "%d", val.value.i32);
+					break;
+				case M3ValueType::c_m3Type_f32:
+					ImGui::LabelText(name, "%f", val.value.f32);
+					break;
+			}
+		}
+	}
+
+	bool onGUI(Span<AssetBrowser::ResourceView*> resources) {
+		if (resources.length() > 1) return false;
+
+		if (ImGui::Button(ICON_FA_PENCIL_ALT " Edit")) {
+			open(resources[0]->getPath());
+		}
+		return false;
+	}
+
+	bool compile(const Path& src) override {
+		if (Path::hasExtension(src.c_str(), "wasm")) {
+			ScriptResource::Header header;
+			OutputMemoryStream compiled(m_allocator);
+			compiled.write(header);
+			FileSystem& fs = m_app.getEngine().getFileSystem();
+			OutputMemoryStream wasm(m_allocator);
+			if (!fs.getContentSync(src, wasm)) {
+				logError("Failed to read ", src);
+				return false;
+			}
+			compiled.write(wasm.data(), wasm.size());
+			return m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (u32)compiled.size()));
+		}
+		else {
+			Graph graph(Path(), m_allocator);
+			FileSystem& fs = m_app.getEngine().getFileSystem();
+		
+			OutputMemoryStream blob(m_allocator);
+			if (!fs.getContentSync(src, blob)) {
+				logError("Failed to read ", src);
+				return false;
+			}
+			InputMemoryStream iblob(blob);
+			if (!graph.deserialize(iblob)) {
+				logError("Failed to deserialize ", src);
+				return false;
+			}
+
+			OutputMemoryStream compiled(m_allocator);
+			graph.generate(compiled);
+			return m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (u32)compiled.size()));
+		}
+	}
+
+	void createResource(OutputMemoryStream& blob) {
+		Graph graph(Path(), m_allocator);
+		graph.addNode<UpdateNode>(graph.m_allocator);
+		graph.serialize(blob);
+	}
+
+	void init() override {}
+	const char* StudioApp::IPlugin::getName() const override { return "visual_script_editor"; }
+	bool showGizmo(struct WorldView& view, struct ComponentUID cmp) override { return false; }
+
+	TagAllocator m_allocator;
+	StudioApp& m_app;
+};
+
+void VisualScriptEditorWindow::destroy() {
+	LUMIX_DELETE(m_editor.m_allocator, this);
+}
+
+
+
 LUMIX_STUDIO_ENTRY(visualscript)
 {
-	auto* plugin = LUMIX_NEW(app.getAllocator(), VisualScriptEditorPlugin)(app);
-	app.addPlugin(*plugin);
-	return nullptr;
+	return LUMIX_NEW(app.getAllocator(), VisualScriptEditor)(app);
 }
+
+} // anonymous namespace
