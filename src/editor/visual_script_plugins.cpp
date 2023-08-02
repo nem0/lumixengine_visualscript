@@ -1979,15 +1979,6 @@ struct VisualScriptEditor : StudioApp::IPlugin, PropertyGrid::IPlugin {
 
 		void onResourceDoubleClicked(const Path& path) override { m_editor.open(path); }
 
-		bool onGUI(Span<AssetBrowser::ResourceView*> resources) override {
-			if (resources.length() > 1) return false;
-
-			if (ImGui::Button(ICON_FA_PENCIL_ALT " Edit")) {
-				m_editor.open(resources[0]->getPath());
-			}
-			return false;
-		}
-
 		bool compile(const Path& src) override {
 			FileSystem& fs = m_editor.m_app.getEngine().getFileSystem();
 			if (Path::hasExtension(src.c_str(), "wasm")) {
