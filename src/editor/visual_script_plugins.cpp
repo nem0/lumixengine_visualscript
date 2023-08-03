@@ -1478,10 +1478,11 @@ struct VisualScriptEditorWindow : AssetEditorWindow, NodeEditor {
 	}
 
 	bool onAction(const Action& action) override {
-		if (&action == &m_app.getDeleteAction()) deleteSelectedNodes();
-		else if (&action == &m_app.getSaveAction()) saveAs(m_graph.m_path);
-		else if (&action == &m_app.getUndoAction()) undo();
-		else if (&action == &m_app.getRedoAction()) redo();
+		const CommonActions& actions = m_app.getCommonActions();
+		if (&action == &actions.del) deleteSelectedNodes();
+		else if (&action == &actions.save) saveAs(m_graph.m_path);
+		else if (&action == &actions.undo) undo();
+		else if (&action == &actions.redo) redo();
 		else return false;
 		return true;
 	}
@@ -1711,15 +1712,16 @@ struct VisualScriptEditorWindow : AssetEditorWindow, NodeEditor {
 	}
 
 	void menu() {
+		const CommonActions& actions = m_app.getCommonActions();
 		if (ImGui::BeginMenuBar()) {
 			if (ImGui::BeginMenu("File")) {
-				if (menuItem(m_app.getSaveAction(), true)) saveAs(m_graph.m_path);
+				if (menuItem(actions.save, true)) saveAs(m_graph.m_path);
 				if (ImGui::MenuItem("Save as")) m_show_save_as = true;
 				ImGui::EndMenu();
 			}
 			if (ImGui::BeginMenu("Edit")) {
-				if (menuItem(m_app.getUndoAction(), canUndo())) undo();
-				if (menuItem(m_app.getRedoAction(), canRedo())) redo();
+				if (menuItem(actions.undo, canUndo())) undo();
+				if (menuItem(actions.redo, canRedo())) redo();
 				ImGui::EndMenu();
 			}
 			if (ImGuiEx::IconButton(ICON_FA_SAVE, "Save")) saveAs(m_graph.m_path);
@@ -1732,8 +1734,6 @@ struct VisualScriptEditorWindow : AssetEditorWindow, NodeEditor {
 		if (fs.gui("Save As", &m_show_save_as, "lvs", true)) saveAs(fs.getPath());
 	}
 
-	void destroy() override;
-	
 	const Path& getPath() override { return m_graph.m_path; }
 
 	void windowGUI() override {
@@ -1957,14 +1957,8 @@ struct VisualScriptEditor : StudioApp::IPlugin, PropertyGrid::IPlugin {
 	}
 
 	void open(const Path& path) {
-		AssetBrowser& ab = m_app.getAssetBrowser();
-		if (AssetEditorWindow* win = ab.getWindow(path)) {
-			win->m_focus_request = true;
-			return;
-		}
-	
-		VisualScriptEditorWindow* new_win = LUMIX_NEW(m_allocator, VisualScriptEditorWindow)(path, *this, m_app, m_allocator);
-		ab.addWindow(new_win);
+		UniquePtr<VisualScriptEditorWindow> new_win = UniquePtr<VisualScriptEditorWindow>::create(m_allocator, path, *this, m_app, m_allocator);
+		m_app.getAssetBrowser().addWindow(new_win.move());
 	}
 
 	void init() override {}
@@ -1977,7 +1971,7 @@ struct VisualScriptEditor : StudioApp::IPlugin, PropertyGrid::IPlugin {
 			, m_editor(editor)
 		{}
 
-		void onResourceDoubleClicked(const Path& path) override { m_editor.open(path); }
+		void openEditor(const Path& path) override { m_editor.open(path); }
 
 		bool compile(const Path& src) override {
 			FileSystem& fs = m_editor.m_app.getEngine().getFileSystem();
@@ -2026,11 +2020,6 @@ struct VisualScriptEditor : StudioApp::IPlugin, PropertyGrid::IPlugin {
 	StudioApp& m_app;
 	AssetPlugin m_asset_plugin;
 };
-
-void VisualScriptEditorWindow::destroy() {
-	LUMIX_DELETE(m_editor.m_allocator, this);
-}
-
 
 
 LUMIX_STUDIO_ENTRY(visualscript)
