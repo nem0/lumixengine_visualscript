@@ -12,6 +12,7 @@
 #include "engine/file_system.h"
 #include "engine/log.h"
 #include "engine/os.h"
+#include "engine/profiler.h"
 #include "engine/reflection.h"
 #include "engine/stack_array.h"
 #include "engine/stream.h"
@@ -1911,8 +1912,8 @@ struct VisualScriptEditor : StudioApp::IPlugin, PropertyGrid::IPlugin {
 	{
 		AssetCompiler& compiler = app.getAssetCompiler();
 		compiler.registerExtension("wasm", ScriptResource::TYPE);
-		const char* exts[] = { "wasm", nullptr };
-		compiler.addPlugin(m_asset_plugin, exts);
+		const char* exts[] = { "wasm" };
+		compiler.addPlugin(m_asset_plugin, Span(exts));
 
 		app.getPropertyGrid().addPlugin(*this);
 	}
@@ -2022,8 +2023,8 @@ struct VisualScriptEditor : StudioApp::IPlugin, PropertyGrid::IPlugin {
 };
 
 
-LUMIX_STUDIO_ENTRY(visualscript)
-{
+LUMIX_STUDIO_ENTRY(visualscript) {
+	PROFILE_FUNCTION();
 	return LUMIX_NEW(app.getAllocator(), VisualScriptEditor)(app);
 }
 

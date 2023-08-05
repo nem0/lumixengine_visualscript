@@ -386,6 +386,7 @@ struct VisualScriptPlugin : ISystem {
 };
 
 LUMIX_PLUGIN_ENTRY(visualscript) {
+	PROFILE_FUNCTION();
 	return LUMIX_NEW(engine.getAllocator(), VisualScriptPlugin)(engine);
 }
 
