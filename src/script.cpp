@@ -27,14 +27,14 @@ ScriptResource::ScriptResource(const Path& path, ResourceManager& resource_manag
 	, m_allocator(allocator)
 {}
 
-bool ScriptResource::load(u64 size, const u8* mem) {
-	InputMemoryStream blob(mem, size);
+bool ScriptResource::load(Span<const u8> mem) {
+	InputMemoryStream blob(mem);
 	Header header;
 	blob.read(header);
 	if (header.magic != Header::MAGIC) return false;
 	if (header.version > Version::LAST) return false;
 
-	u32 bytecode_size = u32(blob.size() - blob.getPosition());
+	u32 bytecode_size = u32(blob.remaining());
 	m_bytecode.resize(bytecode_size);
 	blob.read(m_bytecode.getMutableData(), bytecode_size);
 	return true;

@@ -31,7 +31,7 @@ struct ScriptResource : Resource {
 
 	ResourceType getType() const override { return TYPE; }
 	void unload() override;
-	bool load(u64 size, const u8* mem) override;
+	bool load(Span<const u8> mem) override;
 
 	IAllocator& m_allocator;
 	OutputMemoryStream m_bytecode;
