@@ -191,17 +191,17 @@ struct ScriptModuleImpl : ScriptModule {
 
 	void processEvents() {
 		InputSystem& input = m_engine.getInputSystem();
-		const InputSystem::Event* events = input.getEvents();
-		for (u32 i = 0, c = input.getEventsCount(); i < c; ++i) {
-			switch(events[i].type) {
+		Span<const InputSystem::Event> events = input.getEvents();
+		for (const InputSystem::Event& e : events) {
+			switch(e.type) {
 				case InputSystem::Event::BUTTON:
-					if (events[i].device->type == InputSystem::Device::KEYBOARD) {
-						onKeyEvent(events[i]);
+					if (e.device->type == InputSystem::Device::KEYBOARD) {
+						onKeyEvent(e);
 					}
 					break;
 				case InputSystem::Event::AXIS:
-					if (events[i].device->type == InputSystem::Device::MOUSE) {
-						onMouseMove(events[i]);
+					if (e.device->type == InputSystem::Device::MOUSE) {
+						onMouseMove(e);
 					}
 					break;
 				default: break;
