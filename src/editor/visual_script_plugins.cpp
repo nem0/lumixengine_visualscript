@@ -1696,14 +1696,13 @@ struct VisualScriptEditorWindow : AssetEditorWindow, NodeEditor {
 		m_graph.serialize(blob);
 	}
 
-	void saveAs(const char* path) {
-		ASSERT(path[0]);
+	void saveAs(const Path& path) {
 		OutputMemoryStream tmp(m_allocator);
 		m_graph.generate(tmp); // to update errors
 		OutputMemoryStream blob(m_allocator);
 		m_graph.serialize(blob);
 		FileSystem& fs = m_app.getEngine().getFileSystem();
-		if (!fs.saveContentSync(Path(path), blob)) {
+		if (!fs.saveContentSync(path, blob)) {
 			logError("Failed to save ", path);
 		}
 		else {
@@ -1732,7 +1731,7 @@ struct VisualScriptEditorWindow : AssetEditorWindow, NodeEditor {
 		}
 
 		FileSelector& fs = m_app.getFileSelector();
-		if (fs.gui("Save As", &m_show_save_as, "lvs", true)) saveAs(fs.getPath());
+		if (fs.gui("Save As", &m_show_save_as, "lvs", true)) saveAs(Path(fs.getPath()));
 	}
 
 	const Path& getPath() override { return m_graph.m_path; }
@@ -1823,7 +1822,7 @@ struct VisualScriptEditorWindow : AssetEditorWindow, NodeEditor {
 					if (stristr(label, filter)) {
 						StaticString<256> label_full;
 						for (const auto& s : path) label_full.append(s, " / ");
-						label_full.add(label);
+						label_full.append(label);
 						if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::Selectable(label_full)) {
 							Node* n = creator.create(plugin->m_graph);
 							n->m_pos = pos;
@@ -1986,7 +1985,7 @@ struct VisualScriptEditor : StudioApp::IPlugin, PropertyGrid::IPlugin {
 					return false;
 				}
 				compiled.write(wasm.data(), wasm.size());
-				return m_editor.m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (u32)compiled.size()));
+				return m_editor.m_app.getAssetCompiler().writeCompiledResource(src, Span(compiled.data(), (u32)compiled.size()));
 			}
 			else {
 				Graph graph(Path(), m_editor.m_allocator);
@@ -2004,7 +2003,7 @@ struct VisualScriptEditor : StudioApp::IPlugin, PropertyGrid::IPlugin {
 
 				OutputMemoryStream compiled(m_editor.m_allocator);
 				graph.generate(compiled);
-				return m_editor.m_app.getAssetCompiler().writeCompiledResource(src.c_str(), Span(compiled.data(), (u32)compiled.size()));
+				return m_editor.m_app.getAssetCompiler().writeCompiledResource(src, Span(compiled.data(), (u32)compiled.size()));
 			}
 		}
 
