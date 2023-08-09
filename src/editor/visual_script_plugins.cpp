@@ -1778,7 +1778,7 @@ struct VisualScriptEditorWindow : AssetEditorWindow, NodeEditor {
 			struct : reflection::IEmptyPropertyVisitor {
 				void visit(const reflection::Property<float>& prop) override {
 					StaticString<128> tmp(cmp_name, ".", prop.name);
-					if ((!filter[0] || stristr(tmp, filter)) && ImGui::Selectable(tmp)) {
+					if ((!filter[0] || findInsensitive(tmp, filter)) && ImGui::Selectable(tmp)) {
 						selected = true;
 						copyString(property_name, prop.name);
 					}
@@ -1819,7 +1819,7 @@ struct VisualScriptEditorWindow : AssetEditorWindow, NodeEditor {
 				
 				INodeTypeVisitor& visit(const char* label, ICreator& creator, char shortcut) override {
 					if (created) return *this;
-					if (stristr(label, filter)) {
+					if (findInsensitive(label, filter)) {
 						StaticString<256> label_full;
 						for (const auto& s : path) label_full.append(s, " / ");
 						label_full.append(label);
