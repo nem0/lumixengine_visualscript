@@ -1921,7 +1921,8 @@ struct VisualScriptEditor : StudioApp::IPlugin, PropertyGrid::IPlugin {
 		m_app.getPropertyGrid().removePlugin(*this);
 	}
 
-	void onGUI(PropertyGrid& grid, Span<const EntityRef> entities, ComponentType cmp_type, WorldEditor& editor) override {
+	void onGUI(PropertyGrid& grid, Span<const EntityRef> entities, ComponentType cmp_type, const TextFilter& filter, WorldEditor& editor) override {
+		if (filter.isActive()) return;
 		if (cmp_type != SCRIPT_TYPE) return;
 		if (entities.length() != 1) return;
 
