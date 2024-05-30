@@ -9,7 +9,10 @@ project "visualscript"
 		"genie.lua"
 	}
 	defines { "BUILDING_VISUALSCRIPT" }
-	links { "engine" }
+	links { "engine", "core" }
+	if build_studio then
+		links { "editor" }
+	end
 	useLua()
 	defaultConfigurations()
 
