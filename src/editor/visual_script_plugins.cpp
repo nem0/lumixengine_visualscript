@@ -1479,16 +1479,6 @@ struct VisualScriptEditorWindow : AssetEditorWindow, NodeEditor {
 		m_dirty = false;
 	}
 
-	bool onAction(const Action& action) override {
-		const CommonActions& actions = m_app.getCommonActions();
-		if (&action == &actions.del) deleteSelectedNodes();
-		else if (&action == &actions.save) saveAs(m_graph.m_path);
-		else if (&action == &actions.undo) undo();
-		else if (&action == &actions.redo) redo();
-		else return false;
-		return true;
-	}
-
 	void pushUndo(u32 tag) override {
 		SimpleUndoRedo::pushUndo(tag);
 		m_dirty = true;
@@ -1713,7 +1703,13 @@ struct VisualScriptEditorWindow : AssetEditorWindow, NodeEditor {
 	}
 
 	void menu() {
-		const CommonActions& actions = m_app.getCommonActions();
+		CommonActions& actions = m_app.getCommonActions();
+
+		if (m_app.checkShortcut(actions.del)) deleteSelectedNodes();
+		else if (m_app.checkShortcut(actions.save)) saveAs(m_graph.m_path);
+		else if (m_app.checkShortcut(actions.undo)) undo();
+		else if (m_app.checkShortcut(actions.redo)) redo();
+
 		if (ImGui::BeginMenuBar()) {
 			if (ImGui::BeginMenu("File")) {
 				if (menuItem(actions.save, true)) saveAs(m_graph.m_path);

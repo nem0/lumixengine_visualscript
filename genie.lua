@@ -13,7 +13,6 @@ project "visualscript"
 	if build_studio then
 		links { "editor" }
 	end
-	useLua()
 	defaultConfigurations()
 
 linkPlugin("visualscript")
