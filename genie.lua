@@ -1,5 +1,4 @@
-project "visualscript"
-	libType()
+if plugin "visualscript" then
 	files { 
 		"src/**.c",
 		"src/**.cpp",
@@ -9,10 +8,8 @@ project "visualscript"
 		"genie.lua"
 	}
 	defines { "BUILDING_VISUALSCRIPT" }
-	links { "engine", "core" }
+	dynamic_link_plugin { "engine", "core" }
 	if build_studio then
-		links { "editor" }
+		dynamic_link_plugin { "editor" }
 	end
-	defaultConfigurations()
-
-linkPlugin("visualscript")
+end
