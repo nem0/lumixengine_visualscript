@@ -361,14 +361,7 @@ struct VisualScriptPlugin : ISystem {
 		, m_allocator(engine.getAllocator())
 		, m_script_manager(engine.getAllocator())
 	{
-		OutputMemoryStream wasm_bin(engine.getAllocator());
-		(void)engine.getFileSystem().getContentSync(Path("test.wasm"), wasm_bin);
-
 		m_script_manager.create(ScriptResource::TYPE, engine.getResourceManager());
-	
-		LUMIX_MODULE(ScriptModuleImpl, "script")
-			.LUMIX_CMP(Script, "script", "Script")
-				.LUMIX_PROP(ScriptResource, "Script").resourceAttribute(ScriptResource::TYPE);
 	}
 
 	const char* getName() const override { return "script"; }
